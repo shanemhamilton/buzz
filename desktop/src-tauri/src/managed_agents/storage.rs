@@ -1,5 +1,6 @@
+#[cfg(any(debug_assertions, test))]
+use std::collections::HashMap;
 use std::{
-    collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{Read as _, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -141,6 +142,7 @@ trait KeyStore {
     /// Read a key. `Ok(None)` is "no such entry" (absent); `Err` is a backend
     /// failure (keyring unreachable) — the caller MUST NOT collapse the two.
     fn load(&self, name: &str) -> Result<Option<String>, String>;
+    #[cfg(any(debug_assertions, test))]
     /// Read the entire blob as a map without any side effects.
     /// `Ok(None)` when no blob exists yet; `Err` only on backend failure.
     /// Callers must not call `migrate_legacy_key` — this is a read-only view.
@@ -148,6 +150,7 @@ trait KeyStore {
     /// Write `value` and read it back to confirm before the caller strips the
     /// inline copy.
     fn write_and_verify(&self, name: &str, value: &str) -> Result<(), String>;
+    #[cfg(any(debug_assertions, test))]
     /// Insert all entries from `entries` in a single blob mutation.
     fn store_all(&self, entries: &HashMap<String, String>) -> Result<(), String>;
 }
@@ -159,6 +162,7 @@ impl KeyStore for SecretStore {
     fn load(&self, name: &str) -> Result<Option<String>, String> {
         SecretStore::load(self, name)
     }
+    #[cfg(any(debug_assertions, test))]
     fn load_all_readonly(&self) -> Result<Option<HashMap<String, String>>, String> {
         SecretStore::load_all_readonly(self)
     }
@@ -169,6 +173,7 @@ impl KeyStore for SecretStore {
             _ => Err("keyring read-back verify failed".to_string()),
         }
     }
+    #[cfg(any(debug_assertions, test))]
     fn store_all(&self, entries: &HashMap<String, String>) -> Result<(), String> {
         SecretStore::store_all(self, entries)
     }
@@ -504,7 +509,7 @@ pub fn migrate_agent_keys_to_dev_service(app: &tauri::AppHandle) {
 /// Its presence means all agent keys that existed in the prod service at
 /// migration time have been copied; subsequent dev boots skip the migration
 /// entirely (no prod keyring access).
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 const DEV_MIGRATION_MARKER: &str = "_dev_migration_v1";
 
 /// Testable core of [`migrate_agent_keys_to_dev_service`]: copy `agent:<pubkey>`
@@ -525,7 +530,7 @@ const DEV_MIGRATION_MARKER: &str = "_dev_migration_v1";
 /// may have rotated their key in the dev service after initial migration).
 /// New agents (pubkey not in `src`) are silently skipped — they will mint a
 /// fresh key on their next onboarding run.
-#[cfg(debug_assertions)]
+#[cfg(any(debug_assertions, test))]
 fn copy_agent_keys_between_stores(pubkeys: &[String], src: &impl KeyStore, dst: &impl KeyStore) {
     // One read of the dev blob. If the migration-complete marker is present,
     // all prior agent keys are already in the dev service — skip entirely.

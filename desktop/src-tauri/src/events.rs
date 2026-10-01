@@ -795,7 +795,9 @@ mod tests {
         let owner = "a".repeat(64);
         let workflow_id = Uuid::new_v4().to_string();
         let event = build_workflow_delete(&workflow_id, &owner)
-            .expect("workflow delete builder accepts a valid owner");
+            .expect("workflow delete builder accepts a valid owner")
+            .sign_with_keys(&Keys::generate())
+            .expect("workflow delete event can be signed");
         let coordinate = event
             .tags
             .iter()
