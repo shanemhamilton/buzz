@@ -191,8 +191,12 @@ export async function deleteProfileManagedAgent(
   agent: ManagedAgent,
   context: DeleteProfileManagedAgentContext,
 ): Promise<ProfileManagedAgentDeletionResult> {
-  const { channels, relayAgents, removeAgentFromAllChannels, ...deleteContext } =
-    context;
+  const {
+    channels,
+    relayAgents,
+    removeAgentFromAllChannels,
+    ...deleteContext
+  } = context;
   const result = await deleteManagedAgentWithRules({
     agent,
     channels,

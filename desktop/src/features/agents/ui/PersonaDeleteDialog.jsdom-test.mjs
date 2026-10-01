@@ -28,7 +28,9 @@ test("failed persona delete stays open with an actionable error", async () => {
           persona,
           onConfirm: () => deleting,
           onOpenChange: () => {
-            throw new Error("the dialog must not close before deletion succeeds");
+            throw new Error(
+              "the dialog must not close before deletion succeeds",
+            );
           },
         }),
       );
@@ -54,7 +56,10 @@ test("failed persona delete stays open with an actionable error", async () => {
       await Promise.resolve();
     });
     const error = document.body.querySelector('[role="alert"]');
-    assert.match(error?.textContent ?? "", /failed to secure deletion retry record/);
+    assert.match(
+      error?.textContent ?? "",
+      /failed to secure deletion retry record/,
+    );
     assert.ok(
       document.body.querySelector('[role="alertdialog"]'),
       "failure keeps the confirmation open for retry",

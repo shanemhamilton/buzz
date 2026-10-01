@@ -122,7 +122,12 @@ function setup() {
 
 function mount(
   owner,
-  { agents = [agent], channels = [channel], keys = [PK], seedChannels = true } = {},
+  {
+    agents = [agent],
+    channels = [channel],
+    keys = [PK],
+    seedChannels = true,
+  } = {},
 ) {
   const client = new QueryClient({
     defaultOptions: {

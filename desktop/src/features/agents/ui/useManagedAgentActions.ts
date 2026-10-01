@@ -338,7 +338,9 @@ export function useManagedAgentActions() {
   async function handleDelete(pubkey: string) {
     clearFeedback();
     try {
-      if (pendingRosterCleanupByPubkeyRef.current.has(normalizePubkey(pubkey))) {
+      if (
+        pendingRosterCleanupByPubkeyRef.current.has(normalizePubkey(pubkey))
+      ) {
         await removeAgentFromAllChannels(pubkey);
         return;
       }

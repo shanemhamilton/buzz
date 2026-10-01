@@ -57,6 +57,7 @@ export function PersonaDeleteDialog({
   const [confirmError, setConfirmError] = React.useState<string | null>(null);
 
   React.useEffect(() => {
+    if (!open || !persona?.id) return;
     setIsConfirming(false);
     setConfirmError(null);
   }, [open, persona?.id]);
