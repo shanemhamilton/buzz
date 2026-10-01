@@ -165,12 +165,16 @@ test("direct workflow detail links close back to workflows", async ({
   expect(workflowSearch.get("owner")).toBeTruthy();
   expect(workflowSearch.get("channel")).toBeTruthy();
 
+  const dialog = page.getByRole("dialog", { name: "Edit workflow" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Close", exact: true }).click();
+  await expect(page).toHaveURL(/#\/workflows$/);
+
   // Reopen the exact route emitted by application navigation. A workflow UUID
   // is scoped by its author and channel, so reconstructing it from a card ID
   // would drop the coordinate required for an unambiguous direct link.
   await page.goto(directUrl);
 
-  const dialog = page.getByRole("dialog", { name: "Edit workflow" });
   await expect(dialog.getByText(workflowName, { exact: true })).toBeVisible();
   await expect(
     dialog.getByRole("button", { name: "Trigger: Message Posted" }),
