@@ -158,16 +158,17 @@ test("direct workflow detail links close back to workflows", async ({
   await navigateToWorkflows(page);
   await createWorkflow(page, workflowName);
 
-  const workflowCard = page
-    .locator('[data-testid^="workflow-card-"]')
-    .filter({ hasText: workflowName })
-    .first();
-  const workflowTestId = await workflowCard.getAttribute("data-testid");
-  const workflowId = workflowTestId?.replace("workflow-card-", "");
+  await page.getByRole("button", { name: `View ${workflowName}` }).click();
+  await expect(page).toHaveURL(/#\/workflows\/[^?]+\?/);
+  const directUrl = page.url();
+  const workflowSearch = new URLSearchParams(directUrl.split("?")[1]);
+  expect(workflowSearch.get("owner")).toBeTruthy();
+  expect(workflowSearch.get("channel")).toBeTruthy();
 
-  expect(workflowId).toBeTruthy();
-
-  await page.goto(`/#/workflows/${workflowId}`);
+  // Reopen the exact route emitted by application navigation. A workflow UUID
+  // is scoped by its author and channel, so reconstructing it from a card ID
+  // would drop the coordinate required for an unambiguous direct link.
+  await page.goto(directUrl);
 
   const dialog = page.getByRole("dialog", { name: "Edit workflow" });
   await expect(dialog.getByText(workflowName, { exact: true })).toBeVisible();
