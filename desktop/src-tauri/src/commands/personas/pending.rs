@@ -216,8 +216,9 @@ pub(super) fn prepare_persona_publication_at(
 /// pubkey, d_tag)` (distinct from the purged persona row) with `pending_sync =
 /// 1`; the flush loop publishes it. Purge and enqueue run in one `BEGIN
 /// IMMEDIATE` transaction so a crash between them cannot leave the 30175 head
-/// live with its only retry witness gone. Best-effort: a failure is logged and
-/// swallowed so a retention hiccup never blocks the disk-authoritative delete.
+/// live with its only retry witness gone. This legacy wrapper remains
+/// best-effort for team cascade cleanup; direct persona deletion uses the
+/// strict helper below before removing local records.
 pub(in crate::commands) fn tombstone_persona_pending(
     app: &AppHandle,
     state: &AppState,
@@ -230,6 +231,18 @@ pub(in crate::commands) fn tombstone_persona_pending(
     if let Err(e) = result {
         eprintln!("buzz-desktop: persona-tombstone: {e}");
     }
+}
+
+/// Secure the durable persona deletion retry record before a direct delete
+/// removes its local tracking. Unlike the legacy wrapper, failure reaches the
+/// IPC caller so the UI can keep the deletion open for retry.
+pub(super) fn tombstone_persona_pending_strict(
+    app: &AppHandle,
+    state: &AppState,
+    d_tag: &str,
+) -> Result<(), String> {
+    let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
+    tombstone_persona_at(&scope.db_path, &scope.owner_keys, d_tag)
 }
 
 /// Scope-free core of [`tombstone_persona_pending`], so the atomic purge +

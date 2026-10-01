@@ -4,6 +4,7 @@ import type {
   TriggerWorkflowResponse,
   Workflow,
   WorkflowApproval,
+  WorkflowReference,
   WorkflowRun,
   WorkflowSaveResult,
   TraceEntry,
@@ -203,8 +204,16 @@ export async function getChannelsWorkflows(
   return raw.map(fromRawWorkflow);
 }
 
-export async function getWorkflow(workflowId: string): Promise<Workflow> {
-  const raw = await invokeTauri<RawWorkflow>("get_workflow", { workflowId });
+export async function getWorkflow({
+  channelId,
+  id: workflowId,
+  ownerPubkey,
+}: WorkflowReference): Promise<Workflow> {
+  const raw = await invokeTauri<RawWorkflow>("get_workflow", {
+    channelId,
+    ownerPubkey,
+    workflowId,
+  });
   return fromRawWorkflow(raw);
 }
 
@@ -220,20 +229,26 @@ export async function createWorkflow(
 }
 
 export async function updateWorkflow(
-  workflowId: string,
+  workflow: Workflow,
   yamlDefinition: string,
-  expectedRevision: string,
 ): Promise<WorkflowSaveResult> {
   const raw = await invokeTauri<RawWorkflowSaveResponse>("update_workflow", {
-    workflowId,
+    channelId: workflow.channelId,
+    expectedRevision: workflow.revision,
+    ownerPubkey: workflow.ownerPubkey,
+    workflowId: workflow.id,
     yamlDefinition,
-    expectedRevision,
   });
   return fromRawWorkflowSave(raw);
 }
 
-export async function deleteWorkflow(workflowId: string): Promise<void> {
-  await invokeTauri("delete_workflow", { workflowId });
+export async function deleteWorkflow(workflow: Workflow): Promise<void> {
+  await invokeTauri("delete_workflow", {
+    channelId: workflow.channelId,
+    expectedRevision: workflow.revision,
+    ownerPubkey: workflow.ownerPubkey,
+    workflowId: workflow.id,
+  });
 }
 
 export async function getWorkflowRuns(

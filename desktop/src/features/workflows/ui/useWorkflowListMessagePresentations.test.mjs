@@ -13,6 +13,7 @@ function workflow(index) {
   return {
     id: `workflow-${index}`,
     channelId: CHANNEL_ID,
+    ownerPubkey: `${index}`.repeat(64).slice(0, 64),
     definition: {
       trigger: {
         on: "reaction_added",
@@ -49,7 +50,12 @@ test("loads presentation for many workflow cards with one batched fetch", async 
   assert.equal(calls.length, 1);
   assert.equal(calls[0].length, workflows.length);
   assert.equal(presentations.size, workflows.length);
-  assert.equal(presentations.get("workflow-40")?.messageLabel, "Message 40");
+  assert.equal(
+    presentations.get(
+      `${"40".repeat(64).slice(0, 64)}:workflow-40:${CHANNEL_ID}`,
+    )?.messageLabel,
+    "Message 40",
+  );
 });
 
 test("deduplicates shared message IDs inside the single batch", async () => {
@@ -64,4 +70,18 @@ test("deduplicates shared message IDs inside the single batch", async () => {
   });
 
   assert.deepEqual(requestedIds, [`${"0".repeat(63)}1`]);
+});
+
+test("keeps message presentations separate for duplicate workflow UUIDs", async () => {
+  const first = workflow(1);
+  const second = { ...workflow(1), ownerPubkey: "f".repeat(64) };
+  const lookups = workflowMessageLookups([first, second]);
+
+  const presentations = await loadWorkflowMessagePresentations(
+    lookups,
+    async () => [],
+  );
+
+  assert.equal(presentations.size, 2);
+  assert.notEqual(lookups[0].workflowKey, lookups[1].workflowKey);
 });

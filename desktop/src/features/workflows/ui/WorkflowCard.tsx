@@ -16,6 +16,7 @@ import { motion, useReducedMotion } from "motion/react";
 import * as React from "react";
 
 import type { Workflow } from "@/shared/api/types";
+import { workflowIdentityKey } from "@/shared/api/workflowTypes";
 import { cn } from "@/shared/lib/cn";
 import { Switch } from "@/shared/ui/switch";
 import { WorkflowActionsMenu } from "./WorkflowActionsMenu";
@@ -231,7 +232,7 @@ export function WorkflowCard({
       className={cn(
         "group relative flex min-h-60 w-full flex-col overflow-hidden rounded-2xl bg-muted/50 p-5 text-left text-foreground shadow-xs transition-colors hover:bg-muted/65",
       )}
-      data-testid={`workflow-card-${workflow.id}`}
+      data-testid={`workflow-card-${workflowIdentityKey(workflow)}`}
     >
       <button
         className="absolute inset-0 z-0 rounded-2xl focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"

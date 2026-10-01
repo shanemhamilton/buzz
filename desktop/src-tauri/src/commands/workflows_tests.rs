@@ -274,6 +274,44 @@ fn channel_workflow_filters_accepts_empty_input() {
 }
 
 #[test]
+fn workflow_filter_scopes_the_parameterized_identity() {
+    let owner = "a".repeat(64);
+    assert_eq!(
+        workflow_filter(WF, Some(&owner), Some(CHAN)).expect("valid identity"),
+        serde_json::json!({
+            "kinds": [30620],
+            "#d": [WF],
+            "authors": [owner],
+            "#h": [CHAN],
+        })
+    );
+}
+
+#[test]
+fn unscoped_workflow_selection_refuses_duplicate_uuids() {
+    let first = wf_event(WF, CHAN, YAML);
+    let second = wf_event(WF, CHAN, YAML);
+
+    assert_eq!(
+        select_workflow_event(vec![first, second])
+            .expect_err("ambiguous UUID must not pick a head"),
+        "workflow identity is ambiguous; open it from the workflow list and try again"
+    );
+}
+
+#[test]
+fn cross_author_replacement_is_rejected_before_reauthoring() {
+    let owner = "a".repeat(64);
+    let signer = "b".repeat(64);
+
+    assert_eq!(
+        ensure_workflow_replacement_owner(&owner, &signer)
+            .expect_err("a human signer cannot replace an agent head"),
+        "this workflow belongs to another identity and cannot be changed from Desktop; ask its authoring agent to update it"
+    );
+}
+
+#[test]
 fn trigger_response_uses_persisted_run_id_contract() {
     let wire = trigger_wire_from_message(
         WF.to_string(),

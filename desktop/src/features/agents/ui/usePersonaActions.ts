@@ -9,6 +9,7 @@ import {
   useCreateManagedAgentMutation,
   useCreatePersonaMutation,
   useDeletePersonaMutation,
+  useRelayAgentsQuery,
   useExportAgentSnapshotMutation,
   usePersonasQuery,
   usePreviewAgentSnapshotImportMutation,
@@ -18,6 +19,13 @@ import {
   type AgentSnapshotImportPreview,
   type AgentSnapshotImportResult,
 } from "@/features/agents/hooks";
+import { useChannelsQuery } from "@/features/channels/hooks";
+import {
+  agentRosterCleanupAttempts,
+  agentRosterCleanupError,
+  cleanupAgentRosters,
+  type AgentRosterCleanupAttempt,
+} from "@/features/agents/lib/agentRosterCleanup";
 import {
   getLibraryPersonas,
   getPersonaLabelsById,
@@ -88,6 +96,8 @@ export function usePersonaActions() {
   const updatePersonaAndPublishMutation =
     useUpdatePersonaAndPublishMutation(communityId);
   const deletePersonaMutation = useDeletePersonaMutation();
+  const relayAgentsQuery = useRelayAgentsQuery();
+  const channelsQuery = useChannelsQuery();
   const setPersonaActiveMutation = useSetPersonaActiveMutation();
   const exportAgentSnapshotMutation = useExportAgentSnapshotMutation();
   const previewSnapshotImportMutation = usePreviewAgentSnapshotImportMutation();
@@ -127,6 +137,9 @@ export function usePersonaActions() {
   const createdAgentAttachment = useCreatedAgentChannelAttachment();
   const [isPersonaSubmitPending, setIsPersonaSubmitPending] =
     React.useState(false);
+  const pendingRosterCleanupByPersonaIdRef = React.useRef(
+    new Map<string, AgentRosterCleanupAttempt[]>(),
+  );
 
   const personas = personasQuery.data ?? [];
   const publications = catalogQuery.data ?? [];
@@ -282,15 +295,28 @@ export function usePersonaActions() {
 
   async function handleDelete(persona: AgentPersona) {
     clearFeedback("library");
-    try {
-      await deletePersonaMutation.mutateAsync(persona.id);
-      setPersonaNoticeMessage(`Deleted ${persona.displayName}.`);
-      setPersonaToDelete(null);
-    } catch (error) {
-      setPersonaErrorMessage(
-        error instanceof Error ? error.message : "Failed to delete agent.",
+    const pendingCleanup = pendingRosterCleanupByPersonaIdRef.current.get(
+      persona.id,
+    );
+    const attempts =
+      pendingCleanup ??
+      agentRosterCleanupAttempts(
+        await deletePersonaMutation.mutateAsync(persona.id),
+        channelsQuery.data ?? (await channelsQuery.refetch()).data ?? [],
+        relayAgentsQuery.data ?? [],
       );
+    const cleanup = await cleanupAgentRosters({ attempts, queryClient });
+    const cleanupError = agentRosterCleanupError(cleanup);
+    if (cleanupError) {
+      pendingRosterCleanupByPersonaIdRef.current.set(
+        persona.id,
+        cleanup.failures.length > 0 ? cleanup.failures : attempts,
+      );
+      throw new Error(cleanupError);
     }
+    pendingRosterCleanupByPersonaIdRef.current.delete(persona.id);
+    setPersonaNoticeMessage(`Deleted ${persona.displayName}.`);
+    setPersonaToDelete(null);
   }
 
   async function handleSetActive(

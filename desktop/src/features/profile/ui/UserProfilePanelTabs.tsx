@@ -204,6 +204,7 @@ export function ProfileInfoTabContent({
   archiveActions,
   canArchiveAgent,
   canDeleteAgent,
+  deleteActionLabel,
   channelIdToName,
   isArchived,
   isDeleteAgentPending,
@@ -224,6 +225,7 @@ export function ProfileInfoTabContent({
   archiveActions: IdentityArchiveActions;
   canArchiveAgent: boolean;
   canDeleteAgent: boolean;
+  deleteActionLabel?: string;
   channelIdToName: Record<string, string>;
   isArchived: boolean;
   isDeleteAgentPending: boolean;
@@ -310,6 +312,7 @@ export function ProfileInfoTabContent({
         archiveActions={archiveActions}
         canArchiveAgent={showArchiveAction}
         canDeleteAgent={canDeleteAgent}
+        deleteActionLabel={deleteActionLabel}
         isDeletePending={isDeleteAgentPending}
         managedAgent={managedAgent}
         onCreateCard={onCreateCard}

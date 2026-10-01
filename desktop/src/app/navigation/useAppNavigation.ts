@@ -13,7 +13,7 @@ import {
   type GuardedNavigation,
   traverseHistory,
 } from "@/app/navigation/navigationGuard";
-import type { SearchHit } from "@/shared/api/types";
+import type { SearchHit, Workflow } from "@/shared/api/types";
 
 type NavigationBehavior = {
   force?: boolean;
@@ -187,14 +187,18 @@ export function useAppNavigation() {
   );
 
   const goWorkflow = React.useCallback(
-    (workflowId: string, behavior?: NavigationBehavior) =>
+    (workflow: Workflow, behavior?: NavigationBehavior) =>
       commitNavigation(
         {
           to: "/workflows/$workflowId",
           params: {
-            workflowId,
+            workflowId: workflow.id,
           },
-          search: { pane: "trigger" },
+          search: {
+            channel: workflow.channelId ?? undefined,
+            owner: workflow.ownerPubkey,
+            pane: "trigger",
+          },
           state: { workflowEditorHasOrigin: true },
         },
         behavior,
@@ -233,12 +237,17 @@ export function useAppNavigation() {
   );
 
   const goEditWorkflow = React.useCallback(
-    (workflowId: string, behavior?: NavigationBehavior) =>
+    (workflow: Workflow, behavior?: NavigationBehavior) =>
       commitNavigation(
         {
           to: "/workflows/$workflowId",
-          params: { workflowId },
-          search: { pane: "trigger", view: "edit" },
+          params: { workflowId: workflow.id },
+          search: {
+            channel: workflow.channelId ?? undefined,
+            owner: workflow.ownerPubkey,
+            pane: "trigger",
+            view: "edit",
+          },
           state: { workflowEditorHasOrigin: true },
         },
         behavior,
@@ -247,12 +256,17 @@ export function useAppNavigation() {
   );
 
   const goDuplicateWorkflow = React.useCallback(
-    (workflowId: string, behavior?: NavigationBehavior) =>
+    (workflow: Workflow, behavior?: NavigationBehavior) =>
       commitNavigation(
         {
           to: "/workflows/$workflowId",
-          params: { workflowId },
-          search: { pane: "trigger", view: "duplicate" },
+          params: { workflowId: workflow.id },
+          search: {
+            channel: workflow.channelId ?? undefined,
+            owner: workflow.ownerPubkey,
+            pane: "trigger",
+            view: "duplicate",
+          },
           state: { workflowEditorHasOrigin: true },
         },
         behavior,

@@ -424,6 +424,8 @@ test("rejects a stale card toggle without overwriting a newer edit", async ({
     })) as Array<{
       id: string;
       revision: string;
+      owner_pubkey: string;
+      channel_id: string | null;
       definition: Record<string, unknown>;
     }>;
     const workflow = workflows.find(
@@ -432,6 +434,8 @@ test("rejects a stale card toggle without overwriting a newer edit", async ({
     if (!workflow) throw new Error("created workflow unavailable");
     await invoke("update_workflow", {
       workflowId: workflow.id,
+      ownerPubkey: workflow.owner_pubkey,
+      channelId: workflow.channel_id,
       expectedRevision: workflow.revision,
       yamlDefinition: `name: ${name} edited elsewhere\nenabled: true\ntrigger:\n  on: message_posted\nsteps:\n  - id: step_1\n    action: post_message\n`,
     });
@@ -875,9 +879,13 @@ test("direct workflow routes survive refresh and invalid view opens detail", asy
   await page.getByRole("button", { name: "Workflow actions" }).first().click();
   await page.getByRole("menuitem", { name: "Edit" }).click();
   await expect(page).toHaveURL(/#\/workflows\/[^?]+\?.*view=edit/);
-  const workflowId = new URL(page.url()).hash.match(/workflows\/([^?]+)/)?.[1];
+  const workflowHash = new URL(page.url()).hash;
+  const workflowId = workflowHash.match(/workflows\/([^?]+)/)?.[1];
   expect(workflowId).toBeTruthy();
-  await page.goto(`/#/workflows/${workflowId}?view=invalid`);
+  const workflowSearch = new URLSearchParams(workflowHash.split("?")[1]);
+  await page.goto(
+    `/#/workflows/${workflowId}?owner=${workflowSearch.get("owner") ?? ""}&channel=${workflowSearch.get("channel") ?? ""}&view=invalid`,
+  );
   const detailDialog = page.getByRole("dialog", { name: "Edit workflow" });
   await expect(detailDialog).toBeVisible();
   await expect(detailDialog).toContainText(workflowName);
@@ -933,11 +941,23 @@ test("stale editor save preserves the local draft and reports the conflict", asy
       /workflows\/([^?]+)/,
     )?.[1];
     if (!workflowId) throw new Error("workflow id unavailable");
-    const workflow = (await invoke("get_workflow", { workflowId })) as {
+    const query = new URLSearchParams(
+      new URL(window.location.href).hash.split("?")[1],
+    );
+    const ownerPubkey = query.get("owner");
+    const channelId = query.get("channel");
+    if (!ownerPubkey) throw new Error("workflow owner unavailable");
+    const workflow = (await invoke("get_workflow", {
+      channelId,
+      ownerPubkey,
+      workflowId,
+    })) as {
       revision: string;
     };
     await invoke("update_workflow", {
+      channelId,
       expectedRevision: workflow.revision,
+      ownerPubkey,
       workflowId,
       yamlDefinition:
         "name: authoritative_remote\ntrigger:\n  on: message_posted\nsteps:\n  - id: step_1\n    action: send_message\n    text: remote\n",
@@ -955,17 +975,18 @@ test("unsupported workflow opens canonical YAML without a fabricated sequence", 
 }) => {
   const workflowName = `unsupported_detail_${Date.now()}`;
   await navigateToWorkflows(page);
-  const workflowId = await page.evaluate(async (name) => {
+  const workflow = await page.evaluate(async (name) => {
     const invoke = window.__BUZZ_E2E_INVOKE_MOCK_COMMAND__;
     if (!invoke) throw new Error("mock command bridge unavailable");
-    const workflow = (await invoke("create_workflow", {
+    return (await invoke("create_workflow", {
       channelId: "94a444a4-c0a3-5966-ab05-530c6ddc2301",
       yamlDefinition: `name: ${name}\ntrigger:\n  on: message_posted\n  legacy_filter:\n    author: alice\nsteps:\n  - id: legacy_step\n    action: send_message\n    text: preserve me\n`,
-    })) as { id: string };
-    return workflow.id;
+    })) as { id: string; owner_pubkey: string; channel_id: string | null };
   }, workflowName);
 
-  await page.goto(`/#/workflows/${workflowId}`);
+  await page.goto(
+    `/#/workflows/${workflow.id}?owner=${workflow.owner_pubkey}&channel=${workflow.channel_id ?? ""}`,
+  );
   const detailDialog = page.getByRole("dialog", { name: "Edit workflow" });
   await expect(detailDialog).toBeVisible();
   await expect(detailDialog).toContainText(workflowName);

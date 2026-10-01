@@ -185,8 +185,8 @@ function fromRawPublicationResult(
   };
 }
 
-export async function deletePersona(id: string): Promise<void> {
-  await invokeTauri("delete_persona", { id });
+export async function deletePersona(id: string): Promise<string[]> {
+  return (await invokeTauri<string[] | null>("delete_persona", { id })) ?? [];
 }
 
 export async function setPersonaActive(

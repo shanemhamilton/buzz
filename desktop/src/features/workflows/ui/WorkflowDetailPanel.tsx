@@ -8,7 +8,7 @@ import {
   useWorkflowRunsQuery,
 } from "@/features/workflows/hooks";
 import { WorkflowRunTrace } from "@/features/workflows/ui/WorkflowRunTrace";
-import type { Workflow } from "@/shared/api/types";
+import type { Workflow, WorkflowReference } from "@/shared/api/types";
 import { Badge, type BadgeProps } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
 import { Skeleton } from "@/shared/ui/skeleton";
@@ -19,7 +19,7 @@ import {
 } from "./workflowDefinition";
 
 type WorkflowDetailPanelProps = {
-  workflowId: string;
+  workflow: WorkflowReference;
   onClose?: () => void;
   onEdit?: (workflow: Workflow) => void;
   showDefinition?: boolean;
@@ -27,20 +27,23 @@ type WorkflowDetailPanelProps = {
 };
 
 export function WorkflowDetailPanel({
-  workflowId,
+  workflow: workflowReference,
   onClose,
   onEdit,
   showDefinition = true,
   showHeader = true,
 }: WorkflowDetailPanelProps) {
-  const workflowQuery = useWorkflowQuery(workflowId);
-  const runsQuery = useWorkflowRunsQuery(workflowId);
-  const triggerMutation = useTriggerWorkflowMutation(workflowId);
+  const workflowQuery = useWorkflowQuery(workflowReference);
+  const runsQuery = useWorkflowRunsQuery(workflowReference.id);
+  const triggerMutation = useTriggerWorkflowMutation(workflowReference.id);
   const [selectedRunId, setSelectedRunId] = React.useState<string | null>(null);
 
   const workflow = workflowQuery.data;
   const runs = runsQuery.data ?? [];
-  const approvalsQuery = useRunApprovalsQuery(workflowId, selectedRunId);
+  const approvalsQuery = useRunApprovalsQuery(
+    workflowReference.id,
+    selectedRunId,
+  );
   const workflowDescription = workflow
     ? getWorkflowDescription(workflow.definition)
     : null;
@@ -155,7 +158,7 @@ export function WorkflowDetailPanel({
 
       <div
         className="flex-1 overflow-y-auto"
-        data-scroll-restoration-id={`workflow-detail:${workflowId}`}
+        data-scroll-restoration-id={`workflow-detail:${workflowReference.ownerPubkey}:${workflowReference.id}:${workflowReference.channelId ?? ""}`}
       >
         {workflow ? (
           <div

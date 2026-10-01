@@ -22,10 +22,13 @@ import {
 } from "../lib/useAgentAvailability";
 import { useGlobalAgentConfig } from "@/features/agents/useGlobalAgentConfig";
 import { useChannelsQuery } from "@/features/channels/hooks";
-import { invalidateChannelMembersRosters } from "@/features/channels/rosterFreshness";
 import type { AgentPersona, Channel, ManagedAgent } from "@/shared/api/types";
-import { removeChannelMember } from "@/shared/api/tauri";
 import { normalizePubkey } from "@/shared/lib/pubkey";
+import {
+  agentRosterCleanupAttempts,
+  agentRosterCleanupError,
+  cleanupAgentRosters,
+} from "../lib/agentRosterCleanup";
 import {
   deleteManagedAgentWithRules,
   isManagedAgentActive,
@@ -73,6 +76,9 @@ export function useManagedAgentActions() {
   const [actionErrorMessage, setActionErrorMessage] = React.useState<
     string | null
   >(null);
+  const pendingRosterCleanupByPubkeyRef = React.useRef(
+    new Map<string, ReturnType<typeof agentRosterCleanupAttempts>>(),
+  );
 
   const managedAgentLogQuery = useManagedAgentLogQuery(logAgentPubkey);
 
@@ -306,28 +312,36 @@ export function useManagedAgentActions() {
     }
   }
 
-  function getAgentChannelIds(pubkey: string): string[] {
-    const normalized = normalizePubkey(pubkey);
-    const relayAgent = (relayAgentsQuery.data ?? []).find(
-      (ra) => normalizePubkey(ra.pubkey) === normalized,
-    );
-    return relayAgent?.channelIds ?? [];
-  }
-
   async function removeAgentFromAllChannels(pubkey: string) {
-    const channelIds = getAgentChannelIds(pubkey);
-    if (channelIds.length === 0) return;
-    await Promise.allSettled(
-      channelIds.map((channelId) => removeChannelMember(channelId, pubkey)),
+    const pendingCleanup = pendingRosterCleanupByPubkeyRef.current.get(
+      normalizePubkey(pubkey),
     );
-    // Direct writes bypass the member mutations' invalidation; without this,
-    // the deleted agent stays in cached rosters for the freshness window.
-    await invalidateChannelMembersRosters(queryClient, channelIds);
+    const attempts =
+      pendingCleanup ??
+      agentRosterCleanupAttempts(
+        [pubkey],
+        channelsQuery.data ?? [],
+        relayAgentsQuery.data ?? [],
+      );
+    const cleanup = await cleanupAgentRosters({ attempts, queryClient });
+    const cleanupError = agentRosterCleanupError(cleanup);
+    if (cleanupError) {
+      pendingRosterCleanupByPubkeyRef.current.set(
+        normalizePubkey(pubkey),
+        cleanup.failures.length > 0 ? cleanup.failures : attempts,
+      );
+      throw new Error(cleanupError);
+    }
+    pendingRosterCleanupByPubkeyRef.current.delete(normalizePubkey(pubkey));
   }
 
   async function handleDelete(pubkey: string) {
     clearFeedback();
     try {
+      if (pendingRosterCleanupByPubkeyRef.current.has(normalizePubkey(pubkey))) {
+        await removeAgentFromAllChannels(pubkey);
+        return;
+      }
       const agent = managedAgents.find((a) => a.pubkey === pubkey);
       if (!agent) return;
       const channels = await getChannelsForAction();

@@ -142,10 +142,9 @@ fn cascade_includes_running_agent() {
 }
 
 /// A failing agent-store save in Phase 3 must be retry-safe: the error
-/// propagates before any keyring deletion or tombstone at the call site
-/// (by construction — those side effects appear after the `?` in
-/// `delete_persona`). Persona records and agent records are therefore
-/// untouched on disk, so the command can be retried with no cleanup.
+/// propagates before any keyring deletion. The command now secures the
+/// tombstone/archive retry record before this commit, so local records remain
+/// untouched and a retry may re-enter idempotently with that record present.
 #[test]
 fn failing_save_is_retry_safe() {
     let mut agents = vec![
@@ -164,8 +163,8 @@ fn failing_save_is_retry_safe() {
         "commit must propagate the save error so callers can react"
     );
     // By construction: commit_cascade_agents returns Err before reaching the
-    // keyring deletions and tombstones at the delete_persona call site.
-    // Retrying delete_persona re-runs the full cascade cleanly from scratch.
+    // keyring deletions at the delete_persona call site. The caller's already
+    // secured tombstone/archive transaction is deliberately idempotent.
 }
 
 /// A provider-deployed cascade target (non-local backend with a live

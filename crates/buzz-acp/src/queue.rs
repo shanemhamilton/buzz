@@ -195,6 +195,8 @@ pub struct FlushBatch {
 ///   in_flight_deadlines:  Map<channel_id, Instant>                (auto-expire after in_flight_deadline)
 ///   retry_after:          Map<channel_id, Instant>
 ///   retry_counts:         Map<channel_id, u32>                    (dead-letter after MAX_RETRIES)
+///   quarantined_batches:  Map<channel_id, FlushBatch>             (explicit recovery only)
+///   nonretryable_dispatch_paused: bool                             (runtime-wide provider fault)
 ///   dedup_mode:           DedupMode
 ///
 /// Transitions:
@@ -228,6 +230,10 @@ pub struct FlushBatch {
 ///     increment retry_counts[channel]
 ///     if retry_counts[channel] > MAX_RETRIES: dead-letter (log ERROR, return batch to caller)
 ///     else: push_front with original received_at, set exponential backoff retry_after with jitter
+///
+///   quarantine_nonretryable(batch):
+///     retain the complete batch outside normal dispatch; require an explicit
+///     configuration recovery rather than retrying the unchanged request
 /// ```
 pub struct EventQueue {
     queues: HashMap<SessionScope, VecDeque<QueuedEvent>>,
@@ -239,6 +245,21 @@ pub struct EventQueue {
     retry_after: HashMap<SessionScope, Instant>,
     /// Per-scope retry attempt counter for exponential backoff / dead-lettering.
     retry_counts: HashMap<SessionScope, u32>,
+    /// Batches parked after a provider failure that cannot self-repair.
+    ///
+    /// A parked scope is intentionally invisible to `flush_next`: retrying a
+    /// rejected model, account limit, or credential cannot make it succeed and
+    /// turns one request into a provider-error loop. The complete batch stays
+    /// intact until this runtime exits and is included in removal cleanup.
+    quarantined_batches: HashMap<SessionScope, FlushBatch>,
+    /// A definitive provider failure makes every prompt in this runtime
+    /// ineligible for automatic dispatch. The agent configuration and account
+    /// are shared by all scopes, so allowing a fresh channel or thread through
+    /// would only repeat the same failure and create more notices.
+    ///
+    /// This is deliberately in-memory. Constructing a new runtime clears the
+    /// gate and retained batches; it does not replay them.
+    nonretryable_dispatch_paused: bool,
     dedup_mode: DedupMode,
     /// Events from cancelled batches, keyed by channel. Merged into the next
     /// `FlushBatch` for that channel as `cancelled_events` so `format_prompt()`
@@ -279,6 +300,8 @@ impl EventQueue {
             in_flight_batch_sizes: HashMap::new(),
             retry_after: HashMap::new(),
             retry_counts: HashMap::new(),
+            quarantined_batches: HashMap::new(),
+            nonretryable_dispatch_paused: false,
             dedup_mode,
             cancelled_batches: HashMap::new(),
             cancel_reasons: HashMap::new(),
@@ -432,6 +455,10 @@ impl EventQueue {
             self.recover_withheld_for_expired_scope(&scope);
         }
 
+        if self.nonretryable_dispatch_paused {
+            return None;
+        }
+
         // Find the scope whose head event has the oldest received_at,
         // excluding in-flight scopes and throttled scopes.
         let scope = self
@@ -440,6 +467,7 @@ impl EventQueue {
             .filter(|(scope, q)| {
                 !q.is_empty()
                     && !self.in_flight_scopes.contains(scope)
+                    && !self.quarantined_batches.contains_key(scope)
                     && self.retry_after.get(scope).is_none_or(|&t| t <= now)
             })
             .min_by_key(|(_, q)| q.front().unwrap().received_at)
@@ -454,7 +482,10 @@ impl EventQueue {
                 let cancelled_scope = self
                     .cancelled_batches
                     .keys()
-                    .find(|scope| !self.in_flight_scopes.contains(scope))
+                    .find(|scope| {
+                        !self.in_flight_scopes.contains(scope)
+                            && !self.quarantined_batches.contains_key(scope)
+                    })
                     .cloned();
                 match cancelled_scope {
                     Some(scope) => {
@@ -647,6 +678,46 @@ impl EventQueue {
         None
     }
 
+    /// Pause automatic dispatch after a definitive provider failure.
+    ///
+    /// Returns `true` only for the first failure in this runtime. Callers use
+    /// that edge to post one actionable notice instead of repeating it for
+    /// every scope that was already in flight when the provider fault arrived.
+    pub fn pause_nonretryable_dispatch(&mut self) -> bool {
+        if self.nonretryable_dispatch_paused {
+            false
+        } else {
+            self.nonretryable_dispatch_paused = true;
+            true
+        }
+    }
+
+    /// Retain a batch after a non-retryable provider failure.
+    ///
+    /// Unlike [`requeue`](Self::requeue), this does not increment a retry
+    /// counter or schedule a retry. The batch remains inspectable until this
+    /// runtime exits, but this in-memory queue has no replay path after a
+    /// restart; users must re-send after fixing the provider configuration or
+    /// account. Keeping the full [`FlushBatch`] also preserves interrupted-event
+    /// context instead of silently treating the failed turn as complete.
+    pub fn quarantine_nonretryable(&mut self, batch: FlushBatch) {
+        self.pause_nonretryable_dispatch();
+        let scope = batch.scope.clone();
+        self.retry_after.remove(&scope);
+        self.retry_counts.remove(&scope);
+
+        if let Some(existing) = self.quarantined_batches.get_mut(&scope) {
+            // This should be unreachable because quarantined scopes are not
+            // flushable, but preserve every event if a caller races a manual
+            // recovery path rather than overwriting the original batch.
+            existing.cancelled_events.extend(batch.cancelled_events);
+            existing.events.extend(batch.events);
+            existing.cancel_reason = existing.cancel_reason.or(batch.cancel_reason);
+        } else {
+            self.quarantined_batches.insert(scope, batch);
+        }
+    }
+
     /// Re-queue a **complete** flushed batch preserving original `received_at`
     /// timestamps.
     ///
@@ -762,14 +833,18 @@ impl EventQueue {
             self.recover_withheld_for_expired_scope(&scope);
         }
 
+        if self.nonretryable_dispatch_paused {
+            return false;
+        }
+
         self.queues.iter().any(|(scope, q)| {
             !q.is_empty()
                 && !self.in_flight_scopes.contains(scope)
+                && !self.quarantined_batches.contains_key(scope)
                 && self.retry_after.get(scope).is_none_or(|&t| t <= now)
-        }) || self
-            .cancelled_batches
-            .keys()
-            .any(|scope| !self.in_flight_scopes.contains(scope))
+        }) || self.cancelled_batches.keys().any(|scope| {
+            !self.in_flight_scopes.contains(scope) && !self.quarantined_batches.contains_key(scope)
+        })
     }
 
     /// Returns `true` if any undispatched work remains for a channel that is
@@ -785,9 +860,9 @@ impl EventQueue {
     /// the maintenance timer is disabled and lazy re-wake is itself gated by
     /// flushability) would strand the batch until unrelated traffic arrives.
     ///
-    /// Covers the three tables where undispatched, non-in-flight work can
+    /// Covers the four tables where undispatched, non-in-flight work can
     /// live: non-empty `queues` (throttled or not), pending `cancelled_batches`,
-    /// and `withheld_native_steer` events. Read-only (no in-flight expiry) —
+    /// `quarantined_batches`, and `withheld_native_steer` events. Read-only (no in-flight expiry) —
     /// in-flight liveness is gated separately by [`has_in_flight`](Self::has_in_flight).
     pub fn has_undispatched_work(&self) -> bool {
         let has_queued = self
@@ -798,11 +873,15 @@ impl EventQueue {
             .cancelled_batches
             .keys()
             .any(|scope| !self.in_flight_scopes.contains(scope));
+        let has_quarantined = self
+            .quarantined_batches
+            .keys()
+            .any(|scope| !self.in_flight_scopes.contains(scope));
         let has_withheld = self
             .withheld_native_steer
             .iter()
             .any(|(scope, v)| !v.is_empty() && !self.in_flight_scopes.contains(scope));
-        has_queued || has_cancelled || has_withheld
+        has_queued || has_cancelled || has_quarantined || has_withheld
     }
 
     /// Number of pending partitions (session scopes) with queued events.
@@ -827,6 +906,7 @@ impl EventQueue {
                 .cancelled_batches
                 .get(scope)
                 .is_some_and(|events| !events.is_empty())
+            || self.quarantined_batches.contains_key(scope)
     }
 
     /// Number of queued events for a specific scope (or channel, treated as its
@@ -834,6 +914,14 @@ impl EventQueue {
     #[cfg(test)]
     pub fn queued_event_count<K: IntoScope>(&self, scope: K) -> usize {
         self.queues.get(&scope.into_scope()).map_or(0, |q| q.len())
+    }
+
+    /// Number of events retained after a non-retryable provider failure.
+    #[cfg(test)]
+    pub fn quarantined_event_count<K: IntoScope>(&self, scope: K) -> usize {
+        self.quarantined_batches
+            .get(&scope.into_scope())
+            .map_or(0, |batch| batch.events.len() + batch.cancelled_events.len())
     }
 
     /// Force a channel's retry-attempt counter to `count`, simulating `count`
@@ -856,8 +944,9 @@ impl EventQueue {
     /// Also clears any `retry_after` throttle for the channel.
     ///
     /// Returns the visible event IDs that own lifecycle reactions for every
-    /// dropped event — queued, cancelled carryover, and withheld native
-    /// steers — so the caller can clean up any 👀 added at queue-push time.
+    /// dropped event — queued, cancelled carryover, quarantined, and withheld
+    /// native steers — so the caller can clean up any 👀 added at queue-push
+    /// time.
     /// Edits report their original message (see [`reaction_target_id`]).
     pub fn drain_channel(&mut self, channel_id: Uuid) -> Vec<String> {
         // Channel-wide cleanup must find and clear EVERY child thread scope for
@@ -882,6 +971,17 @@ impl EventQueue {
                 return true;
             }
             events.iter().for_each(|e| collect(&e.event));
+            false
+        });
+        self.quarantined_batches.retain(|s, batch| {
+            if s.channel_id() != channel_id {
+                return true;
+            }
+            batch.events.iter().for_each(|e| collect(&e.event));
+            batch
+                .cancelled_events
+                .iter()
+                .for_each(|e| collect(&e.event));
             false
         });
         self.withheld_native_steer.retain(|s, events| {

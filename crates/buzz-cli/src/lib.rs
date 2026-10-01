@@ -994,6 +994,12 @@ pub enum WorkflowsCmd {
         /// Workflow UUID
         #[arg(long)]
         workflow: String,
+        /// Workflow author pubkey (required when the UUID is shared)
+        #[arg(long)]
+        owner: Option<String>,
+        /// Channel UUID (required when the UUID is shared)
+        #[arg(long)]
+        channel: Option<String>,
     },
     /// Create a workflow from a YAML definition
     Create {
@@ -1012,6 +1018,9 @@ pub enum WorkflowsCmd {
         /// Workflow UUID
         #[arg(long)]
         workflow: String,
+        /// Workflow author pubkey (required when the UUID is shared)
+        #[arg(long)]
+        owner: Option<String>,
         /// Updated workflow YAML definition
         #[arg(long)]
         yaml: String,
@@ -1021,6 +1030,12 @@ pub enum WorkflowsCmd {
         /// Workflow UUID
         #[arg(long)]
         workflow: String,
+        /// Workflow author pubkey (required when the UUID is shared)
+        #[arg(long)]
+        owner: Option<String>,
+        /// Channel UUID (required when the UUID is shared)
+        #[arg(long)]
+        channel: Option<String>,
     },
     /// Trigger a workflow run
     #[command(

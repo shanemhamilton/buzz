@@ -84,7 +84,7 @@ export function UserProfilePersonaDialogs({
   onCloseDelete: () => void;
   onCloseDialog: () => void;
   onCloseExportSnapshot: () => void;
-  onConfirmDelete: (persona: AgentPersona) => void;
+  onConfirmDelete: (persona: AgentPersona) => void | Promise<void>;
   onExportSnapshot: (persona: AgentPersona) => void;
   onSubmit: (input: CreatePersonaInput | UpdatePersonaInput) => Promise<void>;
 }) {

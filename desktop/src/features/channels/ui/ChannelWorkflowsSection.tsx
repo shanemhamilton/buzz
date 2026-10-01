@@ -1,6 +1,7 @@
 import { Plus, Workflow as WorkflowIcon } from "lucide-react";
 
 import type { Workflow } from "@/shared/api/types";
+import { workflowIdentityKey } from "@/shared/api/workflowTypes";
 import { Button } from "@/shared/ui/button";
 import { FieldGroup } from "./ChannelManagementSheetRows";
 
@@ -38,7 +39,7 @@ export function ChannelWorkflowsSection({
             <button
               className="flex min-h-16 w-full items-center gap-3 px-4 py-3 text-left transition-colors hover:bg-muted/40 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
               data-testid={`channel-workflow-${workflow.id}`}
-              key={workflow.id}
+              key={workflowIdentityKey(workflow)}
               onClick={() => onOpen(workflow)}
               type="button"
             >

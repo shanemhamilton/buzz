@@ -792,6 +792,7 @@ export type {
   Workflow,
   WorkflowApproval,
   WorkflowApprovalStatus,
+  WorkflowReference,
   WorkflowRun,
   WorkflowRunStatus,
   WorkflowSaveResult,

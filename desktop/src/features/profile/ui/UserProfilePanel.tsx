@@ -30,6 +30,10 @@ import {
   buildInstanceInputForDefinition,
   resolveStartRuntimeForDefinition,
 } from "@/features/agents/lib/instanceInputForDefinition";
+import {
+  agentRosterCleanupError,
+  type AgentRosterCleanupAttempt,
+} from "@/features/agents/lib/agentRosterCleanup";
 import { describeLogFile } from "@/features/agents/ui/agentUi";
 import { useAgentLifecycleActions } from "@/features/profile/ui/useAgentLifecycleActions";
 import {
@@ -178,6 +182,9 @@ export function UserProfilePanel({
     React.useState<PersonaDialogState | null>(null);
   const [personaToDelete, setPersonaToDelete] =
     React.useState<AgentPersona | null>(null);
+  const pendingPersonaRosterCleanupByIdRef = React.useRef(
+    new Map<string, readonly AgentRosterCleanupAttempt[]>(),
+  );
   const [personaToExportSnapshot, setPersonaToExportSnapshot] =
     React.useState<AgentPersona | null>(null);
   const [requestedInstancePubkey, setRequestedInstancePubkey] = React.useState<
@@ -408,15 +415,18 @@ export function UserProfilePanel({
     if (openResolvedPersonaEditor()) return;
     setEditAgentOpen(true);
   }, [openResolvedPersonaEditor, setEditAgentOpen]);
-  const { deleteManagedAgentRecord, deleteManagedAgentsForPersona } =
-    useProfileAgentDeletion({
-      channels: channelsQuery.data,
-      deleteManagedAgent: deleteAgentMutation.mutateAsync,
-      managedAgent,
-      managedAgents: managedAgentsQuery.data,
-      getAvailability,
-      relayAgents: relayAgentsQuery.data,
-    });
+  const {
+    cleanupDeletedAgentRosters,
+    deleteManagedAgentRecord,
+    deleteManagedAgentsForPersona,
+  } = useProfileAgentDeletion({
+    channels: channelsQuery.data,
+    deleteManagedAgent: deleteAgentMutation.mutateAsync,
+    managedAgent,
+    managedAgents: managedAgentsQuery.data,
+    getAvailability,
+    relayAgents: relayAgentsQuery.data,
+  });
 
   const createManagedAgentForPersona = React.useCallback(
     async (personaToStart: AgentPersona) => {
@@ -510,6 +520,10 @@ export function UserProfilePanel({
     try {
       const result = await deleteManagedAgentRecord(managedAgent);
       if (result.cancelled) return;
+      if (result.cleanupError) {
+        toast.error(result.cleanupError);
+        return;
+      }
 
       toast.success(`Deleted ${managedAgent.name}.`);
       onClose();
@@ -570,6 +584,10 @@ export function UserProfilePanel({
         const deletedInstances =
           await deleteManagedAgentsForPersona(resolvedPersona);
         if (deletedInstances.cancelled) return;
+        if (deletedInstances.cleanupError) {
+          toast.error(deletedInstances.cleanupError);
+          return;
+        }
 
         await setPersonaActiveMutation.mutateAsync({
           id: resolvedPersona.id,
@@ -601,23 +619,34 @@ export function UserProfilePanel({
   const handleConfirmDeletePersona = React.useCallback(
     async (personaToConfirm: AgentPersona) => {
       if (personaToConfirm.sourceTeam) {
-        toast.error("This agent is managed by a team.");
-        setPersonaToDelete(null);
-        return;
+        throw new Error("This agent is managed by a team.");
       }
 
-      try {
-        await deletePersonaMutation.mutateAsync(personaToConfirm.id);
-        toast.success(`Deleted ${personaToConfirm.displayName}.`);
-        setPersonaToDelete(null);
-        onClose();
-      } catch (error) {
-        toast.error(
-          error instanceof Error ? error.message : "Failed to delete agent.",
+      const pendingCleanup = pendingPersonaRosterCleanupByIdRef.current.get(
+        personaToConfirm.id,
+      );
+      const cascadePubkeys = pendingCleanup
+        ? []
+        : await deletePersonaMutation.mutateAsync(personaToConfirm.id);
+      const { attempts, cleanup } = await cleanupDeletedAgentRosters(
+        cascadePubkeys,
+        pendingCleanup,
+      );
+      const cleanupError = agentRosterCleanupError(cleanup);
+      if (cleanupError) {
+        pendingPersonaRosterCleanupByIdRef.current.set(
+          personaToConfirm.id,
+          cleanup.failures.length > 0 ? cleanup.failures : attempts,
         );
+        throw new Error(cleanupError);
       }
+
+      pendingPersonaRosterCleanupByIdRef.current.delete(personaToConfirm.id);
+      toast.success(`Deleted ${personaToConfirm.displayName}.`);
+      setPersonaToDelete(null);
+      onClose();
     },
-    [deletePersonaMutation.mutateAsync, onClose],
+    [cleanupDeletedAgentRosters, deletePersonaMutation.mutateAsync, onClose],
   );
 
   // Count of managed-agent instances backed by the persona being deleted.
@@ -786,6 +815,11 @@ export function UserProfilePanel({
         <ProfileSummaryView
           canAddToChannel={managedAgent !== undefined && isOwner === true}
           canDeleteAgent={canDeleteProfileAgent}
+          deleteActionLabel={
+            !managedAgent && resolvedPersona?.isBuiltIn
+              ? "Remove from My Agents"
+              : "Delete agent"
+          }
           canEditAgent={canEditAgent}
           canInstantiateAgent={canInstantiateAgent}
           canOpenAgentLogs={canOpenAgentLogs}
@@ -967,9 +1001,7 @@ export function UserProfilePanel({
         onCloseDelete={() => setPersonaToDelete(null)}
         onCloseDialog={() => setPersonaDialogState(null)}
         onCloseExportSnapshot={() => setPersonaToExportSnapshot(null)}
-        onConfirmDelete={(selectedPersona) => {
-          void handleConfirmDeletePersona(selectedPersona);
-        }}
+        onConfirmDelete={handleConfirmDeletePersona}
         onExportSnapshot={setPersonaToExportSnapshot}
         onSubmit={handleSubmitPersona}
       />

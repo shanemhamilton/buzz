@@ -44,14 +44,14 @@ export function WorkflowsRouteScreen({
       onCreateWorkflow={() => {
         void goNewWorkflow();
       }}
-      onDuplicateWorkflow={(workflowId) => {
-        void goDuplicateWorkflow(workflowId);
+      onDuplicateWorkflow={(workflow) => {
+        void goDuplicateWorkflow(workflow);
       }}
-      onEditWorkflow={(workflowId) => {
-        void goEditWorkflow(workflowId);
+      onEditWorkflow={(workflow) => {
+        void goEditWorkflow(workflow);
       }}
-      onViewWorkflow={(workflowId) => {
-        void goWorkflow(workflowId);
+      onViewWorkflow={(workflow) => {
+        void goWorkflow(workflow);
       }}
       onEditorPaneChange={onEditorPaneChange}
     />

@@ -4071,8 +4071,29 @@ function handleGetChannelsWorkflows(args: { channelIds: string[] }) {
   );
 }
 
-function handleGetWorkflow(args: { workflowId: string }) {
-  const workflow = mockWorkflows.find((w) => w.id === args.workflowId);
+function workflowMatchesMockIdentity(
+  workflow: MockWorkflow,
+  args: {
+    workflowId: string;
+    ownerPubkey: string;
+    channelId: string | null;
+  },
+) {
+  return (
+    workflow.id === args.workflowId &&
+    workflow.owner_pubkey === args.ownerPubkey &&
+    workflow.channel_id === args.channelId
+  );
+}
+
+function handleGetWorkflow(args: {
+  workflowId: string;
+  ownerPubkey: string;
+  channelId: string | null;
+}) {
+  const workflow = mockWorkflows.find((candidate) =>
+    workflowMatchesMockIdentity(candidate, args),
+  );
   if (!workflow) throw new Error(`Workflow ${args.workflowId} not found`);
   return workflow;
 }
@@ -4113,13 +4134,22 @@ function handleCreateWorkflow(args: {
 
 function handleUpdateWorkflow(args: {
   workflowId: string;
+  ownerPubkey: string;
+  channelId: string | null;
   yamlDefinition: string;
   expectedRevision: string;
 }) {
-  const workflow = mockWorkflows.find((w) => w.id === args.workflowId);
+  const workflow = mockWorkflows.find((candidate) =>
+    workflowMatchesMockIdentity(candidate, args),
+  );
   if (!workflow) throw new Error(`Workflow ${args.workflowId} not found`);
   const configuredError = window.__BUZZ_E2E__?.mock?.workflowUpdateError;
   if (configuredError) throw new Error(configuredError);
+  if (workflow.owner_pubkey !== MOCK_IDENTITY_PUBKEY) {
+    throw new Error(
+      "this workflow belongs to another identity and cannot be changed from Desktop; ask its authoring agent to update it",
+    );
+  }
   if (workflow.revision !== args.expectedRevision) {
     throw new Error(
       "workflow changed since it was loaded; refresh and try again",
@@ -4141,11 +4171,23 @@ function handleUpdateWorkflow(args: {
   };
 }
 
-function handleDeleteWorkflow(args: { workflowId: string }) {
+function handleDeleteWorkflow(args: {
+  workflowId: string;
+  ownerPubkey: string;
+  channelId: string | null;
+  expectedRevision: string;
+}) {
   const configuredError = window.__BUZZ_E2E__?.mock?.workflowDeleteError;
   if (configuredError) throw new Error(configuredError);
-  const index = mockWorkflows.findIndex((w) => w.id === args.workflowId);
+  const index = mockWorkflows.findIndex((candidate) =>
+    workflowMatchesMockIdentity(candidate, args),
+  );
   if (index === -1) throw new Error(`Workflow ${args.workflowId} not found`);
+  if (mockWorkflows[index].revision !== args.expectedRevision) {
+    throw new Error(
+      "workflow changed since it was loaded; refresh and try again",
+    );
+  }
   mockWorkflows.splice(index, 1);
   mockWorkflowRuns = mockWorkflowRuns.filter(
     (run) => run.workflow_id !== args.workflowId,

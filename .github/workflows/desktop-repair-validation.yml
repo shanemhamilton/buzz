@@ -1,0 +1,88 @@
+name: Desktop Repair Validation
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-repair-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-and-build:
+    # This fork testing lane neither signs nor publishes a release.
+    if: github.repository == 'shanemhamilton/buzz' && (github.event_name == 'workflow_dispatch' || github.head_ref == 'fix/desktop-agent-workflow-repairs')
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      TARGET: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          workspaces: |
+            .
+            desktop/src-tauri
+      - name: Install desktop dependencies
+        run: just desktop-install-ci
+      - name: Frontend checks and regression tests
+        run: |
+          set -euo pipefail
+          pnpm --dir desktop typecheck
+          pnpm --dir desktop test
+      - name: Runtime and CLI regression tests
+        run: |
+          set -euo pipefail
+          env -u BUZZ_ACP_ALLOWED_RESPOND_TO -u BUZZ_ACP_LAZY_POOL -u BUZZ_ACP_IDLE_POOL_SLEEP cargo test -p buzz-acp error_outcome_emission_tests -- --test-threads=1
+          cargo test -p buzz-cli workflows::tests
+      - name: Native regression tests
+        run: |
+          set -euo pipefail
+          for name in buzz-acp buzz-agent buzz-backend-kubernetes buzz-dev-mcp git-credential-nostr buzz; do
+            mkdir -p desktop/src-tauri/binaries
+            touch "desktop/src-tauri/binaries/$name-$TARGET"
+          done
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --lib commands::workflows::tests
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --lib commands::personas::delete_cascade_tests
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml --lib agent_tombstone_retry_preserves_archive_persona_id_after_head_purge
+      - name: Version the local repair candidate
+        run: |
+          set -euo pipefail
+          VERSION=$(node -p "const v=require('./desktop/package.json').version.split('-')[0].split('.'); v[2]=Number(v[2])+1; v.join('.')+'-repair.${GITHUB_RUN_NUMBER}'")
+          cd desktop
+          node scripts/set-version-from-tag.mjs "$VERSION"
+          cd src-tauri
+          cargo update --workspace
+      - name: Build actual sidecars
+        run: |
+          set -euo pipefail
+          cargo build --release --target "$TARGET" -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
+          ./scripts/bundle-sidecars.sh "$TARGET"
+      - name: Build local repair app
+        run: cd desktop && pnpm tauri build --no-sign --target "$TARGET" --bundles app --config '{"bundle":{"createUpdaterArtifacts":false}}'
+        env:
+          CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+          MACOSX_DEPLOYMENT_TARGET: "10.15"
+          CMAKE_OSX_DEPLOYMENT_TARGET: "10.15"
+      - name: Archive the app with its source identity
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD > desktop/src-tauri/target/source-commit.txt
+          ditto -c -k --sequesterRsrc --keepParent "desktop/src-tauri/target/$TARGET/release/bundle/macos/Buzz.app" desktop/src-tauri/target/Buzz-repair.zip
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: buzz-desktop-repair-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            desktop/src-tauri/target/Buzz-repair.zip
+            desktop/src-tauri/target/source-commit.txt
+          if-no-files-found: error
+          retention-days: 7

@@ -2,6 +2,7 @@ import { useUsersBatchQuery } from "@/features/profile/hooks";
 import { resolveUserLabel } from "@/features/profile/lib/identity";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import type { Workflow } from "@/shared/api/types";
+import { workflowIdentityKey } from "@/shared/api/workflowTypes";
 import { getWorkflowTriggerConfig } from "./workflowDefinition";
 import {
   type WorkflowAuthorPresentation,
@@ -15,7 +16,7 @@ export type WorkflowCardAuthorPresentation = Omit<
 
 type WorkflowAuthorLookup = {
   pubkey: string;
-  workflowId: string;
+  workflowKey: string;
 };
 
 export function workflowAuthorLookups(
@@ -24,7 +25,9 @@ export function workflowAuthorLookups(
   return workflows.flatMap((workflow) => {
     const trigger = getWorkflowTriggerConfig(workflow.definition);
     const pubkey = trigger ? workflowTriggerAuthorPubkey(trigger) : null;
-    return pubkey ? [{ pubkey, workflowId: workflow.id }] : [];
+    return pubkey
+      ? [{ pubkey, workflowKey: workflowIdentityKey(workflow) }]
+      : [];
   });
 }
 
@@ -37,11 +40,11 @@ export function useWorkflowListAuthorPresentations(
   const profilesQuery = useUsersBatchQuery(pubkeys);
 
   return new Map(
-    lookups.map(({ pubkey, workflowId }) => {
+    lookups.map(({ pubkey, workflowKey }) => {
       const profile = profilesQuery.data?.profiles[pubkey];
       const loading = !profile && profilesQuery.isPending;
       return [
-        workflowId,
+        workflowKey,
         {
           avatarUrl: profile?.avatarUrl ?? null,
           isAgent: profile?.isAgent === true,

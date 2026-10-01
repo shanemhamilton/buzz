@@ -4927,33 +4927,124 @@ fn dispatch_pending(
     dispatched_channels
 }
 
-/// Returns `true` when `error` is a non-retryable authentication failure.
+/// A provider failure that cannot be repaired by retrying the same prompt.
 ///
-/// Retrying auth errors is harmful: the token won't self-repair between
-/// attempts, so each retry wastes an attempt slot, delays the visible failure,
-/// and burns the user's context window. Dead-letter immediately and surface a
-/// re-authentication hint instead.
+/// These variants deliberately carry no provider text. The messages received
+/// from an ACP adapter can contain endpoint URLs, account details, or tokens;
+/// runtime lifecycle and activity events must expose only the safe, actionable
+/// classification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NonRetryablePromptFailure {
+    Authentication,
+    ConfiguredModelUnavailable,
+    UnsupportedProviderModel,
+    MonthlySpendLimit,
+}
+
+impl NonRetryablePromptFailure {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Authentication => "authentication",
+            Self::ConfiguredModelUnavailable => "configured_model_unavailable",
+            Self::UnsupportedProviderModel => "unsupported_provider_model",
+            Self::MonthlySpendLimit => "monthly_spend_limit",
+        }
+    }
+
+    fn notice(self) -> &'static str {
+        match self {
+            Self::Authentication => {
+                "⚠️ I couldn't process the last request: authentication failed. \
+                Please re-authenticate the CLI (e.g. run `claude /login` or `codex login`) \
+                restart the agent, then re-send your request."
+            }
+            Self::ConfiguredModelUnavailable => {
+                "⚠️ I couldn't process the last request: the configured model wasn't found at \
+                the provider's endpoint. Open agent settings, select a different model from the \
+                dropdown, and save your changes. Restart the agent to apply the new configuration, \
+                then re-send your request."
+            }
+            Self::UnsupportedProviderModel => {
+                "⚠️ I couldn't process the last request: the selected model isn't supported by \
+                this ACP provider. Open agent settings, select a supported model, and save your \
+                changes. Restart the agent to apply the new configuration, then re-send your request."
+            }
+            Self::MonthlySpendLimit => {
+                "⚠️ I couldn't process the last request: the provider's monthly spending limit \
+                has been reached. Resolve the provider account limit, restart the agent, then \
+                re-send your request."
+            }
+        }
+    }
+
+    fn runtime_error(self) -> &'static str {
+        match self {
+            Self::Authentication => {
+                "Provider authentication failed. Re-authenticate the CLI, then restart this agent."
+            }
+            Self::ConfiguredModelUnavailable => {
+                "Configured model is unavailable. Select another model, then restart this agent."
+            }
+            Self::UnsupportedProviderModel => {
+                "Selected model is not supported by this ACP provider. Select another model, then restart this agent."
+            }
+            Self::MonthlySpendLimit => {
+                "Provider monthly spending limit reached. Resolve the account limit, then restart this agent."
+            }
+        }
+    }
+}
+
+/// Classify only provider failures that cannot self-repair between retries.
 ///
-/// # Classification rationale
-///
-/// Auth failures arrive as [`acp::AcpError::AgentError`] with a message
-/// surfaced from the upstream CLI. Two narrow patterns reliably identify
-/// non-transient auth failures observed in the field:
-///
-/// - `"Re-authenticate"` — emitted by the Claude CLI when an OAuth token has
-///   expired ("OAuth access token has expired. Re-authenticate to continue.").
-///   Specific to the auth-expiry flow; does not appear in unrelated errors.
-/// - `"API Error: 401"` — present in Claude/Codex HTTP-401 responses; 401 is
-///   the standard auth-failure status and does not arise from network blips.
-///
-/// False positives (misclassifying a transient error as non-retryable) silently
-/// drop a user message, which is worse than a false negative (extra retries on
-/// an auth error). Both patterns are therefore chosen for high precision.
-fn is_auth_error(error: &acp::AcpError) -> bool {
-    let acp::AcpError::AgentError { message, .. } = error else {
-        return false;
+/// This intentionally uses narrow, observed phrases. A false positive would
+/// park a request that a bounded retry could have recovered, whereas an
+/// unrecognized provider error remains on the existing bounded retry path.
+fn classify_non_retryable_error(error: &acp::AcpError) -> Option<NonRetryablePromptFailure> {
+    let acp::AcpError::AgentError { code, message } = error else {
+        return None;
     };
-    message.contains("Re-authenticate") || message.contains("API Error: 401")
+    let message = message.to_ascii_lowercase();
+    // ACP adapters sometimes wrap a JSON provider error as a JSON string.
+    // Normalize that quoting so the observed Codex `status: 400` payload is
+    // classified the same way whether it is emitted directly or through an
+    // adapter envelope.
+    let message = message.replace("\\\"", "\"");
+    let is_http_400 = message.contains("http 400")
+        || message.contains(r#""status":400"#)
+        || message.contains(r#""status": 400"#);
+
+    if *code == -32002 && message.contains("model not found") {
+        Some(NonRetryablePromptFailure::ConfiguredModelUnavailable)
+    } else if is_http_400
+        && (message.contains("unsupported") || message.contains("not supported"))
+        && message.contains("model")
+    {
+        Some(NonRetryablePromptFailure::UnsupportedProviderModel)
+    } else if message.contains("monthly spend limit") || message.contains("monthly-spend-limit") {
+        Some(NonRetryablePromptFailure::MonthlySpendLimit)
+    } else if message.contains("re-authenticate") || message.contains("api error: 401") {
+        Some(NonRetryablePromptFailure::Authentication)
+    } else {
+        None
+    }
+}
+
+fn emit_nonretryable_runtime_failure(
+    observer: Option<&observer::ObserverHandle>,
+    config: &Config,
+    failure: NonRetryablePromptFailure,
+) {
+    let start_nonce = std::env::var("BUZZ_MANAGED_AGENT_START_NONCE").unwrap_or_default();
+    let pubkey = config.keys.public_key().to_hex();
+    emit_runtime_lifecycle(
+        observer,
+        &start_nonce,
+        &pubkey,
+        &config.relay_url,
+        "failed",
+        Some(failure.runtime_error()),
+    );
 }
 
 /// Thread placement for a batch's terminal failure notice.
@@ -5026,6 +5117,12 @@ fn handle_prompt_result(
     observer: Option<observer::ObserverHandle>,
     rest_client: Option<&relay::RestClient>,
 ) -> LoopAction {
+    let nonretryable_failure = match &result.outcome {
+        PromptOutcome::Error(error) => classify_non_retryable_error(error),
+        _ => None,
+    };
+    let first_nonretryable_failure =
+        nonretryable_failure.is_some_and(|_| queue.pause_nonretryable_dispatch());
     let before = pool.task_map().len();
     let agent_index = result.agent.index;
     let successful_steer_deliveries = pool
@@ -5131,38 +5228,22 @@ fn handle_prompt_result(
                 } else {
                     hard_timeout_fate_suffix = Some(" — requeued for retry (recently active)");
                 }
-            } else if matches!(
-                &result.outcome,
-                PromptOutcome::Error(acp::AcpError::AgentError { code: -32002, message })
-                    if message.contains("model not found")
-            ) {
-                // Retrying the same missing model cannot repair its configuration.
+            } else if let Some(failure) = nonretryable_failure {
+                // Re-running the unchanged provider configuration cannot
+                // resolve this failure. Keep the complete batch in memory and
+                // pause all automatic dispatch: configuration and account
+                // state are shared across scopes, so a fresh scope would only
+                // amplify the provider failure.
                 tracing::warn!(
                     channel_id = %batch.channel_id,
                     events = batch.events.len(),
-                    "dead-lettering batch immediately — model not found"
+                    failure = failure.label(),
+                    "quarantining batch after non-retryable provider failure"
                 );
-                let content = "⚠️ I couldn't process the last request: the configured model \
-                    wasn't found at the provider's endpoint. Open agent settings, select a \
-                    different model from the dropdown, and save your changes. Restart the agent \
-                    to apply the new configuration, then re-send your request."
-                    .to_string();
-                spawn_failure_notice(rest_client, &batch, content);
-            } else if matches!(&result.outcome, PromptOutcome::Error(e) if is_auth_error(e)) {
-                // Auth errors are non-retryable: the token won't self-repair
-                // between retries, so requeueing only wastes attempt slots and
-                // delays the visible failure. Dead-letter immediately and tell
-                // the user to re-authenticate the CLI.
-                tracing::warn!(
-                    channel_id = %batch.channel_id,
-                    events = batch.events.len(),
-                    "dead-lettering batch immediately — non-retryable auth error"
-                );
-                let content = "⚠️ I couldn't process the last request: authentication failed. \
-                    Please re-authenticate the CLI (e.g. run `claude /login` or `codex login`) \
-                    and then re-send."
-                    .to_string();
-                spawn_failure_notice(rest_client, &batch, content);
+                queue.quarantine_nonretryable(batch.clone());
+                if first_nonretryable_failure {
+                    spawn_failure_notice(rest_client, &batch, failure.notice().to_string());
+                }
             } else if let Some(dead) = queue.requeue(batch) {
                 let reason = match &result.outcome {
                     PromptOutcome::Timeout(TimeoutKind::Idle) => "the turn timed out".to_string(),
@@ -5189,9 +5270,16 @@ fn handle_prompt_result(
         }
     }
 
+    // This clears only the in-flight dispatch lease. A non-retryable batch is
+    // already retained in `EventQueue::quarantined_batches`; it is not treated
+    // as a completed request.
     match &result.source {
         PromptSource::Channel(scope) => queue.mark_complete(scope.clone()),
         PromptSource::Heartbeat => *heartbeat_in_flight = false,
+    }
+
+    if let Some(failure) = nonretryable_failure.filter(|_| first_nonretryable_failure) {
+        emit_nonretryable_runtime_failure(observer.as_ref(), config, failure);
     }
 
     // Strip sessions for channels the agent was removed from while this
@@ -5412,15 +5500,27 @@ fn handle_prompt_result(
                     return LoopAction::Exit;
                 }
             } else {
-                tracing::warn!(
-                    agent = agent_index,
-                    outcome = outcome_label,
-                    configured_model = %harness_configured_model,
-                    pid = harness_pid,
-                    error = %e,
-                    "agent_returned (application error — pipe intact)"
-                );
-                emit_turn_error(&e.to_string(), error_code);
+                if let Some(failure) = nonretryable_failure {
+                    tracing::warn!(
+                        agent = agent_index,
+                        outcome = outcome_label,
+                        configured_model = %harness_configured_model,
+                        pid = harness_pid,
+                        failure = failure.label(),
+                        "agent_returned (non-retryable provider error — pipe intact)"
+                    );
+                    emit_turn_error(failure.runtime_error(), error_code);
+                } else {
+                    tracing::warn!(
+                        agent = agent_index,
+                        outcome = outcome_label,
+                        configured_model = %harness_configured_model,
+                        pid = harness_pid,
+                        error = %e,
+                        "agent_returned (application error — pipe intact)"
+                    );
+                    emit_turn_error(&e.to_string(), error_code);
+                }
                 pool.return_agent(result.agent);
             }
         }
@@ -11439,66 +11539,74 @@ mod error_outcome_emission_tests {
         assert!(respawn_tasks.is_empty());
     }
 
-    // ── is_auth_error classification ───────────────────────────────────────
+    // ── non-retryable provider-failure classification ─────────────────────
 
     #[test]
-    fn is_auth_error_matches_reauthenticate_message() {
-        let e = acp::AcpError::AgentError {
-            code: -32000,
-            message: "API Error: OAuth access token has expired. Re-authenticate to continue."
-                .to_string(),
-        };
-        assert!(
-            is_auth_error(&e),
-            "Re-authenticate variant must be classified as auth error"
-        );
-    }
+    fn classifies_only_observed_nonretryable_provider_failures() {
+        let cases = [
+            (
+                -32000,
+                "API Error: OAuth access token has expired. Re-authenticate to continue.",
+                Some(NonRetryablePromptFailure::Authentication),
+            ),
+            (
+                -32000,
+                "Internal error: API Error: 401 OAuth access token has expired.",
+                Some(NonRetryablePromptFailure::Authentication),
+            ),
+            (
+                -32002,
+                "llm model not found: configured model is absent",
+                Some(NonRetryablePromptFailure::ConfiguredModelUnavailable),
+            ),
+            (
+                -32000,
+                r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."}}"#,
+                Some(NonRetryablePromptFailure::UnsupportedProviderModel),
+            ),
+            (
+                -32000,
+                "Internal error: You've hit your monthly spend limit · raise it at claude.ai/settings/usage?from=cc_cli_limit_message · your weekly limit resets 8pm (America/Chicago)",
+                Some(NonRetryablePromptFailure::MonthlySpendLimit),
+            ),
+            (
+                -32601,
+                "Usage credits required for 1M context — turn on usage credits",
+                None,
+            ),
+            (-32000, "ACP request failed: HTTP 400 bad request", None),
+            (-32000, "ACP request failed: HTTP 429 rate limit", None),
+            (-32002, "Resource not found: session no longer exists", None),
+        ];
 
-    #[test]
-    fn is_auth_error_matches_401_message() {
-        let e = acp::AcpError::AgentError {
-            code: -32000,
-            message: "Internal error: API Error: 401 OAuth access token has expired.".to_string(),
-        };
-        assert!(
-            is_auth_error(&e),
-            "API Error: 401 variant must be classified as auth error"
-        );
-    }
+        for (code, message, expected) in cases {
+            let error = acp::AcpError::AgentError {
+                code,
+                message: message.to_string(),
+            };
+            assert_eq!(classify_non_retryable_error(&error), expected, "{message}");
+        }
 
-    #[test]
-    fn is_auth_error_rejects_other_agent_error_message() {
-        let e = acp::AcpError::AgentError {
-            code: -32601,
-            message: "Usage credits required for 1M context — turn on usage credits".to_string(),
-        };
-        assert!(
-            !is_auth_error(&e),
-            "usage-credit error must NOT be classified as auth error"
-        );
-    }
-
-    #[test]
-    fn is_auth_error_rejects_transport_errors() {
         let io = acp::AcpError::Io(std::io::Error::other("pipe broke"));
-        assert!(
-            !is_auth_error(&io),
-            "I/O error must not be classified as auth error"
-        );
-        let timeout = acp::AcpError::WriteTimeout(std::time::Duration::from_secs(5));
-        assert!(
-            !is_auth_error(&timeout),
-            "WriteTimeout must not be classified as auth error"
+        assert_eq!(classify_non_retryable_error(&io), None);
+
+        let wrapped_codex_error = acp::AcpError::AgentError {
+            code: -32000,
+            message: r#"ACP adapter error: {\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account.\"}}"#.to_string(),
+        };
+        assert_eq!(
+            classify_non_retryable_error(&wrapped_codex_error),
+            Some(NonRetryablePromptFailure::UnsupportedProviderModel)
         );
     }
 
-    // ── auth error dead-letter behavior ────────────────────────────────────
+    // ── auth error quarantine behavior ────────────────────────────────────
 
-    /// An auth-class `PromptOutcome::Error` must dead-letter immediately
-    /// (the batch is never requeued) so the user sees a re-auth hint at once
-    /// rather than after 10 futile retries.
+    /// An auth-class `PromptOutcome::Error` must be retained without an
+    /// automatic retry so the user sees a re-auth hint at once rather than
+    /// after 10 futile retries.
     #[tokio::test]
-    async fn auth_error_dead_letters_immediately_without_requeueing() {
+    async fn auth_error_quarantines_without_requeueing() {
         let keys = nostr::Keys::generate();
         let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "test")
             .sign_with_keys(&keys)
@@ -11571,16 +11679,29 @@ mod error_outcome_emission_tests {
             None,
         );
 
-        // The batch must not be requeued: pending_channels returns 0.
+        // The failed batch is retained but cannot be automatically re-dispatched.
         assert_eq!(
             queue.pending_channels(),
             0,
-            "auth error must dead-letter immediately — batch must not be requeued"
+            "auth error must not enter the automatic retry queue"
         );
         assert_eq!(
             queue.queued_event_count(channel_id),
             0,
-            "auth error must dead-letter immediately — no events should be pending"
+            "auth error must not leave a retryable event in the queue"
+        );
+        assert_eq!(
+            queue.quarantined_event_count(channel_id),
+            1,
+            "auth error must preserve its failed request for explicit recovery"
+        );
+        assert!(
+            queue.has_undispatched_work(),
+            "auth error must retain work instead of completing the failed request"
+        );
+        assert!(
+            !queue.has_flushable_work(),
+            "a quarantined request must not be retried by the dispatcher"
         );
     }
 
@@ -11628,7 +11749,6 @@ mod error_outcome_emission_tests {
             code: -32002,
             message: raw_error.to_string(),
         };
-        let expected_error = model_error.to_string();
         let observer = ObserverHandle::in_process();
 
         let agent = dummy_agent(0).await;
@@ -11679,16 +11799,30 @@ mod error_outcome_emission_tests {
             Some(&rest),
         );
 
-        // The batch must not be requeued: pending_channels returns 0.
+        // The batch must not be requeued: pending_channels returns 0, while
+        // the failed request remains retained outside normal dispatch.
         assert_eq!(
             queue.pending_channels(),
             0,
-            "model-not-found must stop immediately — batch must not be requeued"
+            "model-not-found must not enter the automatic retry queue"
         );
         assert_eq!(
             queue.queued_event_count(channel_id),
             0,
-            "model-not-found must stop immediately — no events should be pending"
+            "model-not-found must not leave a retryable event in the queue"
+        );
+        assert_eq!(
+            queue.quarantined_event_count(channel_id),
+            1,
+            "model-not-found must retain the failed request for explicit recovery"
+        );
+        assert!(
+            queue.has_undispatched_work(),
+            "model-not-found must retain work instead of completing the failed request"
+        );
+        assert!(
+            !queue.has_flushable_work(),
+            "model-not-found must have zero automatic retry attempts"
         );
 
         assert!(
@@ -11703,7 +11837,28 @@ mod error_outcome_emission_tests {
             .collect();
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].payload["code"], -32002);
-        assert_eq!(errors[0].payload["error"], expected_error);
+        assert_eq!(
+            errors[0].payload["error"],
+            NonRetryablePromptFailure::ConfiguredModelUnavailable.runtime_error()
+        );
+        assert!(
+            !errors[0].payload["error"]
+                .as_str()
+                .unwrap()
+                .contains("gpt-6-astra"),
+            "turn errors must not echo the provider's model detail"
+        );
+        let lifecycles: Vec<_> = observer
+            .snapshot()
+            .into_iter()
+            .filter(|event| event.kind == "managed_agent_runtime_lifecycle")
+            .collect();
+        assert_eq!(lifecycles.len(), 1);
+        assert_eq!(lifecycles[0].payload["lifecycle"], "failed");
+        assert_eq!(
+            lifecycles[0].payload["error"],
+            NonRetryablePromptFailure::ConfiguredModelUnavailable.runtime_error()
+        );
 
         // Capture the real signed notice sent by handle_prompt_result, without a live relay.
         let notice: nostr::Event = tokio::time::timeout(Duration::from_secs(3), async {
@@ -11863,15 +12018,20 @@ mod error_outcome_emission_tests {
         })
     }
 
-    /// A non-auth application error (e.g. usage credits) must still follow the
-    /// standard requeue path so today's behavior is unchanged.
+    /// Ambiguous provider errors must remain on the bounded retry path.
     #[tokio::test]
-    async fn non_auth_application_error_is_requeued() {
-        assert_application_error_is_requeued(acp::AcpError::AgentError {
-            code: -32000,
-            message: "Usage credits required for 1M context".to_string(),
-        })
-        .await;
+    async fn generic_400_transient_429_and_credits_errors_are_requeued() {
+        for message in [
+            "ACP request failed: HTTP 400 bad request",
+            "ACP request failed: HTTP 429 rate limit",
+            "Usage credits required for 1M context",
+        ] {
+            assert_application_error_is_requeued(acp::AcpError::AgentError {
+                code: -32000,
+                message: message.to_string(),
+            })
+            .await;
+        }
     }
 
     #[tokio::test]
@@ -11883,7 +12043,50 @@ mod error_outcome_emission_tests {
         .await;
     }
 
-    async fn assert_application_error_is_requeued(error: acp::AcpError) {
+    #[tokio::test]
+    async fn observed_codex_chatgpt_model_rejection_pauses_all_scopes() {
+        let observed_error = r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."}}"#;
+        let (mut queue, failed_channel_id) = run_application_error(acp::AcpError::AgentError {
+            code: -32000,
+            message: observed_error.to_string(),
+        })
+        .await;
+
+        assert_nonretryable_queue_state(&mut queue, failed_channel_id);
+
+        // The production seam above runs `handle_prompt_result`; a later
+        // message in a fresh channel must remain queued rather than making a
+        // second provider request with the same rejected configuration.
+        let fresh_channel_id = uuid::Uuid::new_v4();
+        let fresh_event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "later request")
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap();
+        assert!(queue.push(QueuedEvent {
+            channel_id: fresh_channel_id,
+            scope: scope::SessionScope::Conversation {
+                channel_id: fresh_channel_id,
+            },
+            event: fresh_event,
+            prompt_tag: "test".to_string(),
+            received_at: std::time::Instant::now(),
+            edit: None,
+        }));
+        assert_eq!(queue.queued_event_count(fresh_channel_id), 1);
+        assert!(queue.has_undispatched_work());
+        assert!(!queue.has_flushable_work());
+        assert!(queue.flush_next().is_none());
+    }
+
+    #[tokio::test]
+    async fn monthly_spend_limit_is_quarantined_without_retrying() {
+        assert_nonretryable_application_error_is_quarantined(acp::AcpError::AgentError {
+            code: -32000,
+            message: "Internal error: You've hit your monthly spend limit · raise it at claude.ai/settings/usage?from=cc_cli_limit_message · your weekly limit resets 8pm (America/Chicago)".to_string(),
+        })
+        .await;
+    }
+
+    async fn run_application_error(error: acp::AcpError) -> (EventQueue, uuid::Uuid) {
         let keys = nostr::Keys::generate();
         let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "test")
             .sign_with_keys(&keys)
@@ -11950,16 +12153,55 @@ mod error_outcome_emission_tests {
             None,
         );
 
-        // Non-auth application error: batch IS requeued (first attempt, retry budget > 0).
+        (queue, channel_id)
+    }
+
+    async fn assert_application_error_is_requeued(error: acp::AcpError) {
+        let (queue, channel_id) = run_application_error(error).await;
+
+        // Unclassified application error: batch IS requeued (first attempt,
+        // retry budget > 0).
         assert_eq!(
             queue.pending_channels(),
             1,
-            "non-auth application error must requeue the batch for retry"
+            "unclassified application error must requeue the batch for retry"
         );
         assert_eq!(
             queue.queued_event_count(channel_id),
             1,
-            "non-auth application error must preserve the event for retry"
+            "unclassified application error must preserve the event for retry"
+        );
+    }
+
+    async fn assert_nonretryable_application_error_is_quarantined(error: acp::AcpError) {
+        let (mut queue, channel_id) = run_application_error(error).await;
+
+        assert_nonretryable_queue_state(&mut queue, channel_id);
+    }
+
+    fn assert_nonretryable_queue_state(queue: &mut EventQueue, channel_id: uuid::Uuid) {
+        assert_eq!(
+            queue.pending_channels(),
+            0,
+            "non-retryable provider failure must not enter the automatic retry queue"
+        );
+        assert_eq!(
+            queue.queued_event_count(channel_id),
+            0,
+            "non-retryable provider failure must not leave a retryable event in the queue"
+        );
+        assert_eq!(
+            queue.quarantined_event_count(channel_id),
+            1,
+            "non-retryable provider failure must preserve the failed request"
+        );
+        assert!(
+            queue.has_undispatched_work(),
+            "non-retryable provider failure must retain work instead of completing it"
+        );
+        assert!(
+            !queue.has_flushable_work(),
+            "non-retryable provider failure must have zero automatic retry attempts"
         );
     }
 }

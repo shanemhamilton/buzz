@@ -29,6 +29,7 @@ export function UserProfileAgentManagementRows({
   archiveActions,
   canArchiveAgent,
   canDeleteAgent,
+  deleteActionLabel = "Delete agent",
   isDeletePending,
   managedAgent,
   supplementalAction,
@@ -40,6 +41,8 @@ export function UserProfileAgentManagementRows({
   archiveActions: IdentityArchiveActions;
   canArchiveAgent: boolean;
   canDeleteAgent: boolean;
+  /** Built-in personas are deactivated, not deleted. */
+  deleteActionLabel?: string;
   isDeletePending: boolean;
   managedAgent?: ManagedAgent;
   supplementalAction?: React.ReactNode;
@@ -96,6 +99,7 @@ export function UserProfileAgentManagementRows({
       {canDeleteAgent ? (
         <ProfileDeleteAgentRow
           isPending={isDeletePending}
+          label={deleteActionLabel}
           managedAgent={managedAgent}
           onDelete={onDeleteAgent}
         />
@@ -202,10 +206,12 @@ function ProfileArchiveAgentRow({
 
 function ProfileDeleteAgentRow({
   isPending,
+  label,
   managedAgent,
   onDelete,
 }: {
   isPending: boolean;
+  label: string;
   managedAgent?: ManagedAgent;
   onDelete: () => void;
 }) {
@@ -217,7 +223,7 @@ function ProfileDeleteAgentRow({
         destructive
         disabled={isPending}
         icon={Trash2}
-        label="Delete agent"
+        label={label}
         onClick={() => {
           if (managedAgent) {
             setConfirmOpen(true);

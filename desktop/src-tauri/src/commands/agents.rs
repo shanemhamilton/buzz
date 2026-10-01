@@ -1182,21 +1182,19 @@ pub async fn delete_managed_agent(
             if !records.iter().any(|record| record.pubkey == pubkey) {
                 return Err(format!("agent {pubkey} not found"));
             }
+            if let Some(record) = records.iter_mut().find(|record| record.pubkey == pubkey) {
+                stop_managed_agent_process(&app, record, &mut runtimes)?;
+            }
+            // The NIP-09 tombstone and NIP-IA archive request are one durable
+            // retry record. Secure them before clearing assignments, the managed
+            // record, or its key: a failed enqueue must leave deletion retryable.
+            tombstone_managed_agent_pending(&app, &state, &pubkey)?;
             run_managed_agent_deletion(&base_dir, &pubkey, &mut records, |records| {
-                if let Some(record) = records.iter_mut().find(|record| record.pubkey == pubkey) {
-                    stop_managed_agent_process(&app, record, &mut runtimes)?;
-                }
-                state.clear_agent_session_caches(&pubkey);
                 records.retain(|record| record.pubkey != pubkey);
                 save_managed_agents(&app, records)
             })?;
+            state.clear_agent_session_caches(&pubkey);
             crate::managed_agents::delete_agent_key(&pubkey);
-            // Tombstone after confirmed removal (inside lock; every published
-            // agent tombstones). The NIP-IA kind:9035 archive request — which
-            // stops the identity appearing in member pickers and autocomplete —
-            // is enqueued in the SAME transaction, its `persona_id` derived from
-            // the retained 30177 head.
-            tombstone_managed_agent_pending(&app, &state, &pubkey);
         }
         try_regenerate_nest(&app);
         Ok(())

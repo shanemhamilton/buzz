@@ -177,22 +177,19 @@ fn channel_workflow_filters(channel_ids: Vec<String>) -> Result<Vec<Value>, Stri
 #[tauri::command]
 pub async fn get_workflow(
     workflow_id: String,
+    owner_pubkey: String,
+    channel_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<WorkflowWire, String> {
-    let events = query_relay(
-        &state,
-        &[serde_json::json!({
-            "kinds": [30620],
-            "#d": [workflow_id],
-            "limit": 1
-        })],
-    )
-    .await?;
-
-    events
-        .first()
-        .map(workflow_from_event)
-        .ok_or_else(|| "workflow not found".to_string())
+    Ok(workflow_from_event(
+        &workflow_event(
+            &state,
+            &workflow_id,
+            Some(&owner_pubkey),
+            channel_id.as_deref(),
+        )
+        .await?,
+    ))
 }
 
 #[tauri::command]
@@ -256,30 +253,29 @@ pub async fn create_workflow(
 #[tauri::command]
 pub async fn update_workflow(
     workflow_id: String,
+    owner_pubkey: String,
+    channel_id: Option<String>,
     yaml_definition: String,
     expected_revision: String,
     state: State<'_, AppState>,
 ) -> Result<WorkflowSaveWire, String> {
-    // Find the channel id (and creation time) from the existing workflow event
-    // so the new event carries the same `h` tag — kind:30620 is replaceable by
-    // (pubkey, d-tag).
-    let prior = query_relay(
+    // A kind:30620 head is identified by (author, d-tag), not UUID alone.
+    // Scope the read to the workflow the UI rendered so a duplicate UUID from
+    // another author cannot be selected and re-published under this signer.
+    let owner_pubkey = canonical_workflow_owner(&owner_pubkey)?;
+    let prior_event = workflow_event(
         &state,
-        &[serde_json::json!({
-            "kinds": [30620],
-            "#d": [workflow_id.clone()],
-            "limit": 1
-        })],
+        &workflow_id,
+        Some(&owner_pubkey),
+        channel_id.as_deref(),
     )
     .await?;
-
-    let prior_event = prior
-        .first()
-        .ok_or_else(|| "workflow not found".to_string())?;
     if prior_event.id.to_hex() != expected_revision {
         return Err("workflow changed since it was loaded; refresh and try again".to_string());
     }
-    let channel_id = tag_value(prior_event, "h").ok_or_else(|| "workflow not found".to_string())?;
+    ensure_workflow_replacement_owner(&owner_pubkey, &current_pubkey_hex(&state)?)?;
+    let channel_id = tag_value(&prior_event, "h")
+        .ok_or_else(|| "workflow channel is missing; refresh and try again".to_string())?;
     let created_at = prior_event.created_at.as_secs() as i64;
 
     let builder = events::build_workflow_definition(
@@ -295,7 +291,7 @@ pub async fn update_workflow(
         workflow_id,
         result.event_id,
         Some(channel_id),
-        current_pubkey_hex(&state)?,
+        owner_pubkey,
         &yaml_definition,
         created_at,
         updated_at,
@@ -311,11 +307,41 @@ pub async fn update_workflow(
 #[tauri::command]
 pub async fn delete_workflow(
     workflow_id: String,
+    owner_pubkey: String,
+    channel_id: Option<String>,
+    expected_revision: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let builder = events::build_workflow_delete(&workflow_id, &current_pubkey_hex(&state)?)?;
+    // Resolve the exact visible head before building the coordinate. NIP-09
+    // authorizes an owning human to delete their agent's event, while edits
+    // cannot be re-authored this way. The readback below makes a rejected or
+    // no-op deletion visible instead of closing the UI as if it succeeded.
+    let owner_pubkey = canonical_workflow_owner(&owner_pubkey)?;
+    let prior_event = workflow_event(
+        &state,
+        &workflow_id,
+        Some(&owner_pubkey),
+        channel_id.as_deref(),
+    )
+    .await?;
+    if prior_event.id.to_hex() != expected_revision {
+        return Err("workflow changed since it was loaded; refresh and try again".to_string());
+    }
+
+    let builder = events::build_workflow_delete(&workflow_id, &owner_pubkey)?;
     submit_event(builder, &state).await?;
-    Ok(())
+    match workflow_event(
+        &state,
+        &workflow_id,
+        Some(&owner_pubkey),
+        channel_id.as_deref(),
+    )
+    .await
+    {
+        Err(error) if error == "workflow not found" => Ok(()),
+        Ok(_) => Err("workflow deletion was not confirmed; refresh and try again".to_string()),
+        Err(error) => Err(format!("workflow deletion could not be confirmed: {error}")),
+    }
 }
 
 #[tauri::command]
@@ -389,6 +415,77 @@ fn trigger_wire_from_message(
 fn current_pubkey_hex(state: &AppState) -> Result<String, String> {
     let keys = state.keys.lock().map_err(|e| e.to_string())?;
     Ok(keys.public_key().to_hex())
+}
+
+/// Resolve one workflow head. Visible-workflow callers must supply its author;
+/// an optional channel adds the remaining visible coordinate scope.
+async fn workflow_event(
+    state: &AppState,
+    workflow_id: &str,
+    owner_pubkey: Option<&str>,
+    channel_id: Option<&str>,
+) -> Result<nostr::Event, String> {
+    let filter = workflow_filter(workflow_id, owner_pubkey, channel_id)?;
+    select_workflow_event(query_relay(state, &[filter]).await?)
+}
+
+fn workflow_filter(
+    workflow_id: &str,
+    owner_pubkey: Option<&str>,
+    channel_id: Option<&str>,
+) -> Result<Value, String> {
+    let workflow_id = uuid::Uuid::parse_str(workflow_id)
+        .map_err(|_| "invalid workflow id".to_string())?
+        .to_string();
+    let mut filter = serde_json::json!({
+        "kinds": [30620],
+        "#d": [workflow_id],
+    });
+    if let Some(owner_pubkey) = owner_pubkey {
+        filter["authors"] = serde_json::json!([canonical_workflow_owner(owner_pubkey)?]);
+    }
+    if let Some(channel_id) = channel_id {
+        let channel_id = uuid::Uuid::parse_str(channel_id.trim())
+            .map_err(|_| "invalid workflow channel id".to_string())?
+            .to_string();
+        filter["#h"] = serde_json::json!([channel_id]);
+    }
+    Ok(filter)
+}
+
+fn select_workflow_event(events: Vec<nostr::Event>) -> Result<nostr::Event, String> {
+    match events.len() {
+        0 => Err("workflow not found".to_string()),
+        1 => events
+            .into_iter()
+            .next()
+            .ok_or_else(|| "workflow not found".to_string()),
+        _ => Err(
+            "workflow identity is ambiguous; open it from the workflow list and try again"
+                .to_string(),
+        ),
+    }
+}
+
+fn canonical_workflow_owner(owner_pubkey: &str) -> Result<String, String> {
+    let owner_pubkey = owner_pubkey.trim();
+    if owner_pubkey.len() != 64 || !owner_pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("invalid workflow owner".to_string());
+    }
+    Ok(owner_pubkey.to_ascii_lowercase())
+}
+
+fn ensure_workflow_replacement_owner(
+    owner_pubkey: &str,
+    signer_pubkey: &str,
+) -> Result<(), String> {
+    if owner_pubkey == signer_pubkey {
+        return Ok(());
+    }
+    Err(
+        "this workflow belongs to another identity and cannot be changed from Desktop; ask its authoring agent to update it"
+            .to_string(),
+    )
 }
 
 fn now_secs() -> i64 {
