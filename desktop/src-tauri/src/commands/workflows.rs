@@ -469,6 +469,12 @@ fn select_workflow_event(events: Vec<nostr::Event>) -> Result<nostr::Event, Stri
 
 fn canonical_workflow_owner(owner_pubkey: &str) -> Result<String, String> {
     let owner_pubkey = owner_pubkey.trim();
+    if owner_pubkey.is_empty() {
+        return Err(
+            "workflow link is missing its author; open it from the workflow list and try again"
+                .to_string(),
+        );
+    }
     if owner_pubkey.len() != 64 || !owner_pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err("invalid workflow owner".to_string());
     }

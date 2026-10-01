@@ -130,20 +130,24 @@ fn collect_remote_deployed(
         .collect()
 }
 
-/// Remove cascade agents from `agents` and persist via the injectable `save`.
+/// Remove cascade agents from `agents`, persist, then clear per-agent local
+/// state through the injectable `cleanup`.
 ///
 /// Extracted from `delete_persona` so unit tests can inject a failing save and
 /// verify retry-safety without a full `AppHandle` mock: if `save` returns `Err`,
-/// this function propagates it before keyring deletion. The caller has already
-/// secured a durable, idempotent tombstone/archive retry record, while local
-/// records remain intact and the command is safe to retry.
+/// this function propagates it before local cache or key deletion. On a
+/// successful agent-record save, cleanup runs before the separate persona save
+/// can fail, so local keys cannot outlive their persisted agent records.
 fn commit_cascade_agents(
     agents: &mut Vec<ManagedAgentRecord>,
     cascade: &std::collections::HashSet<String>,
     save: impl FnOnce(&[ManagedAgentRecord]) -> Result<(), String>,
+    cleanup: impl FnOnce(&std::collections::HashSet<String>),
 ) -> Result<(), String> {
     agents.retain(|a| !cascade.contains(&a.pubkey));
-    save(agents)
+    save(agents)?;
+    cleanup(cascade);
+    Ok(())
 }
 
 #[tauri::command]
@@ -259,13 +263,22 @@ pub async fn delete_persona(id: String, app: AppHandle) -> Result<Vec<String>, S
             // Failure semantics:
             //   agent save fails   → no local record/key is removed; retry uses
             //                        the already-secured tombstone idempotently
-            //   persona save fails → cascade agents gone, persona survives; a retry
-            //                        finds an empty cascade and proceeds cleanly
-            // Keys are removed only after every affected record leaves disk.
+            //   persona save fails → cascade agents and their local keys are
+            //                        gone, persona survives; retry finds an
+            //                        empty cascade and proceeds cleanly
+            // Keys are removed only after their affected record leaves disk.
             if !cascade.is_empty() {
-                commit_cascade_agents(&mut agents, &cascade, |recs| {
-                    save_managed_agents(&app, recs)
-                })?;
+                commit_cascade_agents(
+                    &mut agents,
+                    &cascade,
+                    |recs| save_managed_agents(&app, recs),
+                    |deleted_pubkeys| {
+                        for pk in deleted_pubkeys {
+                            state.clear_agent_session_caches(pk);
+                            delete_agent_key(pk);
+                        }
+                    },
+                )?;
             }
 
             let original_len = personas.len();
@@ -274,13 +287,6 @@ pub async fn delete_persona(id: String, app: AppHandle) -> Result<Vec<String>, S
                 return Err(format!("persona {id} not found"));
             }
             save_personas(&app, &personas)?;
-
-            // Side effects — strictly after records leave disk.
-            for pk in &cascade {
-                state.clear_agent_session_caches(pk);
-                // Remove nsec from keyring after the record is gone.
-                delete_agent_key(pk);
-            }
 
             // _store_guard drops here, before try_regenerate_nest.
             cascade.into_iter().collect()

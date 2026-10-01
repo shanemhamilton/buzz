@@ -156,6 +156,7 @@ pub async fn cmd_delete_workflow(
     workflow_id: &str,
     owner_pubkey: Option<&str>,
     channel_id: Option<&str>,
+    expected_revision: Option<&str>,
 ) -> Result<(), CliError> {
     let wf_uuid = parse_uuid(workflow_id)?;
     let existing = select_workflow_event(
@@ -163,6 +164,7 @@ pub async fn cmd_delete_workflow(
         workflow_id,
     )?;
     let workflow_owner = workflow_owner(&existing)?;
+    ensure_expected_workflow_revision(&existing, expected_revision)?;
 
     let builder = buzz_sdk::build_workflow_delete(&workflow_owner, wf_uuid).map_err(sdk_err)?;
     let event = client.sign_event(builder)?;
@@ -253,6 +255,24 @@ fn workflow_revision(event: &serde_json::Value) -> Result<String, CliError> {
         .and_then(|value| value.as_str())
         .map(ToOwned::to_owned)
         .ok_or_else(|| CliError::Other("workflow event has no revision".to_string()))
+}
+
+fn ensure_expected_workflow_revision(
+    event: &serde_json::Value,
+    expected_revision: Option<&str>,
+) -> Result<(), CliError> {
+    let Some(expected_revision) = expected_revision else {
+        return Ok(());
+    };
+    validate_hex64(expected_revision)?;
+    let resolved_revision = workflow_revision(event)?;
+    validate_hex64(&resolved_revision)?;
+    if resolved_revision.to_ascii_lowercase() == expected_revision.to_ascii_lowercase() {
+        return Ok(());
+    }
+    Err(CliError::Conflict(
+        "workflow changed since it was loaded; refresh and try again".to_string(),
+    ))
 }
 
 fn ensure_workflow_replacement_owner(
@@ -362,7 +382,17 @@ pub async fn dispatch(cmd: crate::WorkflowsCmd, client: &BuzzClient) -> Result<(
             workflow,
             owner,
             channel,
-        } => cmd_delete_workflow(client, &workflow, owner.as_deref(), channel.as_deref()).await,
+            expected_revision,
+        } => {
+            cmd_delete_workflow(
+                client,
+                &workflow,
+                owner.as_deref(),
+                channel.as_deref(),
+                expected_revision.as_deref(),
+            )
+            .await
+        }
         WorkflowsCmd::Trigger { workflow, inputs } => {
             cmd_trigger_workflow(client, &workflow, inputs.as_deref()).await
         }
@@ -423,5 +453,27 @@ mod tests {
         let event = serde_json::json!({"pubkey": owner});
 
         assert_eq!(workflow_owner(&event).expect("valid owner"), "a".repeat(64));
+    }
+
+    #[test]
+    fn delete_revision_guard_rejects_a_stale_head() {
+        let current = "a".repeat(64);
+        let stale = "b".repeat(64);
+        let event = serde_json::json!({"id": current});
+
+        let error = ensure_expected_workflow_revision(&event, Some(&stale))
+            .expect_err("stale revision must stop deletion before signing");
+        assert!(
+            matches!(error, CliError::Conflict(message) if message.contains("workflow changed"))
+        );
+    }
+
+    #[test]
+    fn delete_revision_guard_rejects_malformed_expected_revision() {
+        let event = serde_json::json!({"id": "a".repeat(64)});
+
+        let error = ensure_expected_workflow_revision(&event, Some("not-an-event-id"))
+            .expect_err("malformed revision must fail before signing");
+        assert!(matches!(error, CliError::Usage(_)));
     }
 }

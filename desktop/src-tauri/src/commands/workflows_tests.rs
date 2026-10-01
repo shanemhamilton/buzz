@@ -312,6 +312,14 @@ fn cross_author_replacement_is_rejected_before_reauthoring() {
 }
 
 #[test]
+fn missing_workflow_owner_instructs_the_user_to_open_the_list() {
+    assert_eq!(
+        canonical_workflow_owner("").expect_err("deep link without an owner must fail"),
+        "workflow link is missing its author; open it from the workflow list and try again"
+    );
+}
+
+#[test]
 fn trigger_response_uses_persisted_run_id_contract() {
     let wire = trigger_wire_from_message(
         WF.to_string(),

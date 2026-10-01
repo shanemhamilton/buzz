@@ -1036,6 +1036,9 @@ pub enum WorkflowsCmd {
         /// Channel UUID (required when the UUID is shared)
         #[arg(long)]
         channel: Option<String>,
+        /// Current workflow event ID; rejects deletion if the head changed
+        #[arg(long)]
+        expected_revision: Option<String>,
     },
     /// Trigger a workflow run
     #[command(
