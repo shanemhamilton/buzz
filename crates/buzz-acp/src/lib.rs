@@ -634,6 +634,12 @@ struct QueuedNormalListenerEvent {
     reaction_target_id: String,
     event_for_steer: nostr::Event,
     prompt_tag_for_steer: String,
+    pending_nonretryable_notice: Option<PendingNonretryableNotice>,
+}
+
+struct PendingNonretryableNotice {
+    content: String,
+    edit: Option<queue::ResolvedEdit>,
 }
 
 impl QueuedNormalListenerEvent {
@@ -648,6 +654,29 @@ impl QueuedNormalListenerEvent {
         });
     }
 
+    /// Post the runtime's one deferred provider-failure notice against the
+    /// first accepted channel event after a heartbeat discovered the fault.
+    fn post_pending_nonretryable_notice(&mut self, rest_client: &relay::RestClient) {
+        let Some(PendingNonretryableNotice { content, edit }) =
+            self.pending_nonretryable_notice.take()
+        else {
+            return;
+        };
+        let batch = FlushBatch {
+            channel_id: self.scope.channel_id(),
+            scope: self.scope.clone(),
+            events: vec![queue::BatchEvent {
+                edit,
+                event: self.event_for_steer.clone(),
+                prompt_tag: self.prompt_tag_for_steer.clone(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        spawn_failure_notice(Some(rest_client), &batch, content);
+    }
+
     fn steer_or_interrupt(
         self,
         handling: MultipleEventHandling,
@@ -656,7 +685,10 @@ impl QueuedNormalListenerEvent {
         queue: &mut EventQueue,
         steer_ack_tx: &mpsc::UnboundedSender<SteerAckEvent>,
     ) {
-        if !self.accepted || !queue.is_scope_in_flight(&self.scope) {
+        if !self.accepted
+            || queue.is_nonretryable_dispatch_paused()
+            || !queue.is_scope_in_flight(&self.scope)
+        {
             return;
         }
         let Some(signal) = mode_gate_signal(handling, &self.effective_author, owner) else {
@@ -722,14 +754,30 @@ impl NormalListenerIngress {
         let event_for_steer = buzz_event.event.clone();
         let prompt_tag_for_steer = prompt_tag.clone();
         let channel_id = buzz_event.channel_id;
+        let received_at = std::time::Instant::now();
+        // Resolved edit routing is needed only if a heartbeat left a notice
+        // pending. Clone before the event enters the queue so the notice can
+        // retain the same routing context without removing the request.
+        let notice_edit = if queue.is_nonretryable_dispatch_paused() {
+            edit.clone()
+        } else {
+            None
+        };
         let accepted = queue.push(QueuedEvent {
             channel_id,
             scope: session_scope.clone(),
             event: buzz_event.event,
-            received_at: std::time::Instant::now(),
+            received_at,
             prompt_tag,
             edit,
         });
+        let pending_nonretryable_notice = accepted
+            .then(|| queue.take_nonretryable_notice())
+            .flatten()
+            .map(|content| PendingNonretryableNotice {
+                content,
+                edit: notice_edit,
+            });
         QueuedNormalListenerEvent {
             accepted,
             scope: session_scope,
@@ -737,6 +785,7 @@ impl NormalListenerIngress {
             reaction_target_id,
             event_for_steer,
             prompt_tag_for_steer,
+            pending_nonretryable_notice,
         }
     }
 }
@@ -3592,13 +3641,14 @@ async fn run_harness(
                                 policy = %config.session_policy,
                                 "admitted event — resolved session scope"
                             );
-                            let queued = ingress.push(&mut queue, session_scope);
+                            let mut queued = ingress.push(&mut queue, session_scope);
                             // 👀 — immediate "seen" reaction, only if the event
                             // was actually queued (not dropped by DedupMode::Drop).
                             // Fire-and-forget: on rare fast-failure paths the
                             // guard's cleanup may race with this add, leaving a
                             // cosmetic stale 👀. Acceptable — see ReactionGuard docs.
                             queued.mark_seen(&ctx.rest_client);
+                            queued.post_pending_nonretryable_notice(&ctx.rest_client);
                             // Event is already queued. The authorized ingress
                             // retains its verified author, resolved scope, and
                             // event data through the optional steer/interrupt
@@ -3716,10 +3766,17 @@ async fn run_harness(
                         {
                             typing_channels.insert(scope, thread_tags);
                         }
-                    } else if pool.any_idle() {
+                    } else if heartbeat_dispatch_allowed(
+                        &queue,
+                        heartbeat_in_flight,
+                        pool.any_idle(),
+                    ) {
                         dispatch_heartbeat(&mut pool, &ctx, &mut heartbeat_in_flight);
                     } else {
-                        tracing::debug!("heartbeat_skipped_busy");
+                        tracing::debug!(
+                            paused = queue.is_nonretryable_dispatch_paused(),
+                            "heartbeat_skipped"
+                        );
                     }
                     None
                 }
@@ -5121,8 +5178,8 @@ fn handle_prompt_result(
         PromptOutcome::Error(error) => classify_non_retryable_error(error),
         _ => None,
     };
-    let first_nonretryable_failure =
-        nonretryable_failure.is_some_and(|_| queue.pause_nonretryable_dispatch());
+    let newly_paused_nonretryable_failure = nonretryable_failure
+        .is_some_and(|failure| queue.pause_nonretryable_dispatch(failure.notice().to_string()));
     let before = pool.task_map().len();
     let agent_index = result.agent.index;
     let successful_steer_deliveries = pool
@@ -5241,8 +5298,8 @@ fn handle_prompt_result(
                     "quarantining batch after non-retryable provider failure"
                 );
                 queue.quarantine_nonretryable(batch.clone());
-                if first_nonretryable_failure {
-                    spawn_failure_notice(rest_client, &batch, failure.notice().to_string());
+                if let Some(content) = queue.take_nonretryable_notice() {
+                    spawn_failure_notice(rest_client, &batch, content);
                 }
             } else if let Some(dead) = queue.requeue(batch) {
                 let reason = match &result.outcome {
@@ -5278,7 +5335,17 @@ fn handle_prompt_result(
         PromptSource::Heartbeat => *heartbeat_in_flight = false,
     }
 
-    if let Some(failure) = nonretryable_failure.filter(|_| first_nonretryable_failure) {
+    // A heartbeat has no channel reply context. If accepted work was already
+    // waiting when it found the definitive provider fault, use that preserved
+    // context for the runtime's sole recovery notice instead of waiting for a
+    // later ingress that may never arrive. Removed channels cannot consume it.
+    if let Some((batch, content)) =
+        queue.take_nonretryable_notice_for_pending_batch(removed_channels)
+    {
+        spawn_failure_notice(rest_client, &batch, content);
+    }
+
+    if let Some(failure) = nonretryable_failure.filter(|_| newly_paused_nonretryable_failure) {
         emit_nonretryable_runtime_failure(observer.as_ref(), config, failure);
     }
 
@@ -5677,6 +5744,14 @@ fn drain_ready_join_results(
         }
     }
     LoopAction::Continue
+}
+
+fn heartbeat_dispatch_allowed(
+    queue: &EventQueue,
+    heartbeat_in_flight: bool,
+    pool_has_idle_agent: bool,
+) -> bool {
+    !queue.is_nonretryable_dispatch_paused() && !heartbeat_in_flight && pool_has_idle_agent
 }
 
 fn dispatch_heartbeat(
@@ -9998,14 +10073,11 @@ mod build_mcp_servers_tests {
 
 #[cfg(test)]
 mod error_outcome_emission_tests {
-    //! Pins the policy that error-class outcomes surface to the activity feed
-    //! and never to the channel:
+    //! Pins error-outcome reporting and bounded channel recovery notices:
     //!
-    //! - Channel silence is enforced *structurally* — `handle_prompt_result`
-    //!   takes no relay handle, so it has no way to post a channel message. A
-    //!   future re-introduction of channel notices would have to add the relay
-    //!   parameter back, which these tests' construction would then refuse to
-    //!   compile against.
+    //! - Only definitive provider faults emit one sanitized recovery notice,
+    //!   either from the failed channel batch or from a preserved accepted
+    //!   channel context after a heartbeat fault.
     //! - Feed coverage is the regression-prone half and is asserted at runtime:
     //!   each error outcome must emit exactly one `turn_error` observer event.
     //!   If any branch drops its `emit_turn_error` call, the matching test goes
@@ -11721,8 +11793,6 @@ mod error_outcome_emission_tests {
         edit: Option<queue::ResolvedEdit>,
         lookup: serde_json::Value,
     ) -> (nostr::Event, relay::RestClient, uuid::Uuid) {
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let rest = relay::RestClient {
             http: reqwest::Client::new(),
@@ -11861,7 +11931,17 @@ mod error_outcome_emission_tests {
         );
 
         // Capture the real signed notice sent by handle_prompt_result, without a live relay.
-        let notice: nostr::Event = tokio::time::timeout(Duration::from_secs(3), async {
+        let notice = receive_failure_notice(listener, lookup).await;
+        (notice, rest, channel_id)
+    }
+
+    async fn receive_failure_notice(
+        listener: tokio::net::TcpListener,
+        lookup: serde_json::Value,
+    ) -> nostr::Event {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 let (socket, _) = listener.accept().await.unwrap();
                 let mut reader = BufReader::new(socket);
@@ -11904,8 +11984,7 @@ mod error_outcome_emission_tests {
             }
         })
         .await
-        .expect("failure notice must be posted on the first failure");
-        (notice, rest, channel_id)
+        .expect("failure notice must be posted on the first failure")
     }
 
     #[tokio::test]
@@ -12078,6 +12157,129 @@ mod error_outcome_emission_tests {
     }
 
     #[tokio::test]
+    async fn heartbeat_model_rejection_notifies_the_next_accepted_channel_without_dispatching() {
+        let observed_error = r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."}}"#;
+        let mut queue = run_heartbeat_application_error(acp::AcpError::AgentError {
+            code: -32000,
+            message: observed_error.to_string(),
+        })
+        .await;
+
+        assert!(queue.is_nonretryable_dispatch_paused());
+        assert!(
+            !heartbeat_dispatch_allowed(&queue, false, true),
+            "a paused runtime must not issue another heartbeat provider request"
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rest = relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+            keys: Keys::generate(),
+            auth_tag_json: None,
+        };
+        let channel_id = uuid::Uuid::new_v4();
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "later request")
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap();
+        let mut queued = NormalListenerIngress {
+            buzz_event: relay::BuzzEvent {
+                connection_generation: 0,
+                channel_id,
+                event,
+            },
+            effective_author: "test-author".to_string(),
+            prompt_tag: "test".to_string(),
+            edit: None,
+        }
+        .push(&mut queue, scope::SessionScope::Conversation { channel_id });
+
+        assert!(queued.accepted);
+        assert_eq!(
+            queued
+                .pending_nonretryable_notice
+                .as_ref()
+                .map(|notice| notice.content.as_str()),
+            Some(NonRetryablePromptFailure::UnsupportedProviderModel.notice())
+        );
+        queued.post_pending_nonretryable_notice(&rest);
+        let notice = receive_failure_notice(listener, serde_json::json!([])).await;
+        assert_eq!(notice.pubkey, rest.keys.public_key());
+        assert_eq!(
+            notice.content,
+            NonRetryablePromptFailure::UnsupportedProviderModel.notice()
+        );
+        assert!(queued.pending_nonretryable_notice.is_none());
+        assert_eq!(queue.queued_event_count(channel_id), 1);
+        assert!(!queue.has_flushable_work());
+        assert!(queue.flush_next().is_none());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_model_rejection_notifies_existing_eligible_pending_work() {
+        let channel_id = uuid::Uuid::new_v4();
+        let scope = scope::SessionScope::Conversation { channel_id };
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "waiting request")
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap();
+        assert!(queue.push(QueuedEvent {
+            channel_id,
+            scope: scope.clone(),
+            event,
+            prompt_tag: "test".to_string(),
+            received_at: std::time::Instant::now(),
+            edit: None,
+        }));
+        let retryable_batch = queue.flush_next().expect("accepted request flushes once");
+        assert!(queue.requeue(retryable_batch).is_none());
+        queue.mark_complete(scope);
+        assert!(
+            !queue.has_flushable_work(),
+            "the backoff keeps the accepted request pending when the heartbeat fires"
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rest = relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+            keys: Keys::generate(),
+            auth_tag_json: None,
+        };
+        let observed_error = r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."}}"#;
+        let mut queue = run_error_result(
+            queue,
+            acp::AcpError::AgentError {
+                code: -32000,
+                message: observed_error.to_string(),
+            },
+            PromptSource::Heartbeat,
+            None,
+            Some(&rest),
+        )
+        .await;
+
+        let notice = receive_failure_notice(listener, serde_json::json!([])).await;
+        assert_eq!(notice.pubkey, rest.keys.public_key());
+        assert_eq!(
+            notice.content,
+            NonRetryablePromptFailure::UnsupportedProviderModel.notice()
+        );
+        assert!(
+            !notice.content.contains("gpt-6.1-sol"),
+            "the channel notice must not expose provider payload detail"
+        );
+        assert_eq!(queue.queued_event_count(channel_id), 1);
+        assert!(queue.is_nonretryable_dispatch_paused());
+        assert!(!queue.has_flushable_work());
+        assert!(queue.flush_next().is_none());
+        assert!(
+            queue.take_nonretryable_notice().is_none(),
+            "the existing accepted request claims the one runtime notice"
+        );
+    }
+
+    #[tokio::test]
     async fn monthly_spend_limit_is_quarantined_without_retrying() {
         assert_nonretryable_application_error_is_quarantined(acp::AcpError::AgentError {
             code: -32000,
@@ -12105,6 +12307,36 @@ mod error_outcome_emission_tests {
             cancel_reason: None,
         };
 
+        let queue = run_error_result(
+            EventQueue::new(config::DedupMode::Queue),
+            error,
+            PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
+            Some(batch),
+            None,
+        )
+        .await;
+
+        (queue, channel_id)
+    }
+
+    async fn run_heartbeat_application_error(error: acp::AcpError) -> EventQueue {
+        run_error_result(
+            EventQueue::new(config::DedupMode::Queue),
+            error,
+            PromptSource::Heartbeat,
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn run_error_result(
+        mut queue: EventQueue,
+        error: acp::AcpError,
+        source: PromptSource,
+        batch: Option<FlushBatch>,
+        rest_client: Option<&relay::RestClient>,
+    ) -> EventQueue {
         let agent = dummy_agent(0).await;
         let mut pool = AgentPool::from_slots(vec![None]);
         let task_id = pool.join_set.spawn(async {}).id();
@@ -12121,7 +12353,6 @@ mod error_outcome_emission_tests {
                 successful_steer_deliveries: HashSet::new(),
             },
         );
-        let mut queue = EventQueue::new(config::DedupMode::Queue);
         let config = test_config();
         let mut heartbeat_in_flight = false;
         let removed_channels = std::collections::HashSet::new();
@@ -12134,10 +12365,10 @@ mod error_outcome_emission_tests {
         let mut respawn_tasks = tokio::task::JoinSet::new();
         let result = PromptResult {
             agent,
-            source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
+            source,
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::Error(error),
-            batch: Some(batch),
+            batch,
         };
         handle_prompt_result(
             &mut pool,
@@ -12150,10 +12381,10 @@ mod error_outcome_emission_tests {
             &respawn_tx,
             &mut respawn_tasks,
             None,
-            None,
+            rest_client,
         );
 
-        (queue, channel_id)
+        queue
     }
 
     async fn assert_application_error_is_requeued(error: acp::AcpError) {

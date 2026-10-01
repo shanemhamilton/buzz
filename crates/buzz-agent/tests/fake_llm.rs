@@ -1500,11 +1500,25 @@ fn openai_tool_call_with_usage(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn steer_rejected_on_empty_prompt() {
-    let (url, _captures) = spawn_capturing_fake_llm(vec![
-        openai_tool_call("call_x", "fake__noop", json!({})),
-        openai_text("done"),
-    ])
-    .await;
+    use tokio::sync::oneshot;
+
+    // Keep the prompt live until the invalid steer reply arrives. Writing a
+    // frame to the subprocess does not guarantee it has processed the frame;
+    // without the gate a fast two-round fake response can complete first.
+    let (gate_tx, gate_rx) = oneshot::channel::<()>();
+    let gate_rx = Arc::new(Mutex::new(Some(gate_rx)));
+    let responses = vec![
+        CannedResponse {
+            status: 200,
+            body: openai_tool_call("call_x", "fake__noop", json!({})),
+        },
+        CannedResponse {
+            status: 200,
+            body: openai_text("done"),
+        },
+    ];
+    let captures: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let (url, _captures) = spawn_gated_capturing_fake_llm(responses, captures, gate_rx).await;
     let mut h = Harness::spawn(&url).await;
     let sid = init_session(&mut h).await;
     let p_id = h
@@ -1520,17 +1534,14 @@ async fn steer_rejected_on_empty_prompt() {
             json!({"sessionId": sid, "expectedRunId": run_id, "prompt": []}),
         )
         .await;
-    let mut saw_reject = false;
-    for _ in 0..40 {
-        let v = h.recv().await;
-        if v["id"] == json!(s_id) {
-            assert_eq!(v["error"]["code"], -32602, "empty prompt must be rejected");
-            saw_reject = true;
-        } else if v["id"] == json!(p_id) {
-            break;
-        }
-    }
-    assert!(saw_reject, "empty steer prompt was not rejected");
+    let v = h.recv_until(|v| v["id"] == json!(s_id)).await;
+    assert_eq!(v["error"]["code"], -32602, "empty prompt must be rejected");
+
+    // The invalid steer was observed while the prompt was still live; let the
+    // held provider round finish so the harness can cleanly close the process.
+    let _ = gate_tx.send(());
+    let v = h.recv_until(|v| v["id"] == json!(p_id)).await;
+    assert_eq!(v["result"]["stopReason"], "end_turn");
     h.shutdown().await;
 }
 

@@ -51,6 +51,11 @@ type ProfileManagedAgentDeletionResult = ManagedAgentActionResult & {
   cleanupError?: string;
 };
 
+type DeleteManagedAgentRecordOptions = {
+  /** The direct profile-agent dialog has already obtained this confirmation. */
+  skipRemoteDeleteConfirm?: boolean;
+};
+
 export function useProfileAgentDeletion({
   channels,
   deleteManagedAgent,
@@ -108,6 +113,7 @@ export function useProfileAgentDeletion({
   const deleteManagedAgentRecord = React.useCallback(
     async (
       agentToDelete: ManagedAgent,
+      { skipRemoteDeleteConfirm = true }: DeleteManagedAgentRecordOptions = {},
     ): Promise<ProfileManagedAgentDeletionResult> => {
       const pendingCleanup = pendingCleanupByPubkeyRef.current.get(
         agentToDelete.pubkey.toLowerCase(),
@@ -137,7 +143,7 @@ export function useProfileAgentDeletion({
         getAvailability,
         relayAgents: relayAgents ?? [],
         removeAgentFromAllChannels,
-        skipRemoteDeleteConfirm: true,
+        skipRemoteDeleteConfirm,
       });
       if (result.cleanupError && result.cleanupAttempts) {
         pendingCleanupByPubkeyRef.current.set(
@@ -171,7 +177,11 @@ export function useProfileAgentDeletion({
       }
 
       for (const agent of agentsByPubkey.values()) {
-        const result = await deleteManagedAgentRecord(agent);
+        // Built-in persona removal has no AgentDeleteConfirmDialog. It must
+        // retain the deployed-agent confirmation, including unknown presence.
+        const result = await deleteManagedAgentRecord(agent, {
+          skipRemoteDeleteConfirm: false,
+        });
         if (result.cancelled || result.cleanupError) return result;
       }
       return {};

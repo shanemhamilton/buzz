@@ -267,7 +267,7 @@ fn ensure_expected_workflow_revision(
     validate_hex64(expected_revision)?;
     let resolved_revision = workflow_revision(event)?;
     validate_hex64(&resolved_revision)?;
-    if resolved_revision.to_ascii_lowercase() == expected_revision.to_ascii_lowercase() {
+    if resolved_revision.eq_ignore_ascii_case(expected_revision) {
         return Ok(());
     }
     Err(CliError::Conflict(

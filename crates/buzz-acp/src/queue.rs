@@ -260,6 +260,12 @@ pub struct EventQueue {
     /// This is deliberately in-memory. Constructing a new runtime clears the
     /// gate and retained batches; it does not replay them.
     nonretryable_dispatch_paused: bool,
+    /// The first definitive provider failure's sanitized recovery notice.
+    ///
+    /// A heartbeat has no channel to notify, so it leaves this pending until
+    /// the runtime finds an eligible accepted channel event or normal ingress
+    /// supplies one. The notice is taken exactly once.
+    pending_nonretryable_notice: Option<String>,
     dedup_mode: DedupMode,
     /// Events from cancelled batches, keyed by channel. Merged into the next
     /// `FlushBatch` for that channel as `cancelled_events` so `format_prompt()`
@@ -302,6 +308,7 @@ impl EventQueue {
             retry_counts: HashMap::new(),
             quarantined_batches: HashMap::new(),
             nonretryable_dispatch_paused: false,
+            pending_nonretryable_notice: None,
             dedup_mode,
             cancelled_batches: HashMap::new(),
             cancel_reasons: HashMap::new(),
@@ -680,16 +687,93 @@ impl EventQueue {
 
     /// Pause automatic dispatch after a definitive provider failure.
     ///
-    /// Returns `true` only for the first failure in this runtime. Callers use
-    /// that edge to post one actionable notice instead of repeating it for
-    /// every scope that was already in flight when the provider fault arrived.
-    pub fn pause_nonretryable_dispatch(&mut self) -> bool {
+    /// Returns `true` only for the first failure in this runtime. A heartbeat
+    /// has no channel reply context, so callers provide the sanitized notice
+    /// here and claim it from an eligible pending batch or later normal
+    /// ingress.
+    pub fn pause_nonretryable_dispatch(&mut self, notice: String) -> bool {
         if self.nonretryable_dispatch_paused {
             false
         } else {
             self.nonretryable_dispatch_paused = true;
+            self.pending_nonretryable_notice = Some(notice);
             true
         }
+    }
+
+    /// Whether automatic provider work is paused for this runtime.
+    pub fn is_nonretryable_dispatch_paused(&self) -> bool {
+        self.nonretryable_dispatch_paused
+    }
+
+    /// Claim the one pending sanitized recovery notice after accepting a
+    /// channel event. Returns `None` after it has been claimed or when no
+    /// definitive provider failure has occurred.
+    pub fn take_nonretryable_notice(&mut self) -> Option<String> {
+        self.pending_nonretryable_notice.take()
+    }
+
+    /// Claim the one pending sanitized recovery notice against the oldest
+    /// eligible accepted event already waiting for dispatch.
+    ///
+    /// This lets a heartbeat-originated provider fault notify a request that
+    /// was accepted before the fault, even if no later listener event arrives.
+    /// In-flight scopes are excluded: their provider turn is already running
+    /// and a later result will make any queued follow-up eligible. Removed
+    /// channels are excluded so a stale event cannot consume the only notice.
+    pub(crate) fn take_nonretryable_notice_for_pending_batch(
+        &mut self,
+        removed_channels: &HashSet<Uuid>,
+    ) -> Option<(FlushBatch, String)> {
+        self.pending_nonretryable_notice.as_ref()?;
+
+        let in_flight_scopes = &self.in_flight_scopes;
+        let mut candidate: Option<(SessionScope, BatchEvent)> = None;
+        let mut consider = |scope: &SessionScope, event: BatchEvent| {
+            if removed_channels.contains(&scope.channel_id()) || in_flight_scopes.contains(scope) {
+                return;
+            }
+            if candidate
+                .as_ref()
+                .is_none_or(|(_, oldest)| event.received_at < oldest.received_at)
+            {
+                candidate = Some((scope.clone(), event));
+            }
+        };
+
+        for (scope, events) in &self.queues {
+            if let Some(event) = events.front().cloned().map(QueuedEvent::into_batch_event) {
+                consider(scope, event);
+            }
+        }
+        for (scope, events) in &self.cancelled_batches {
+            if let Some(event) = events.iter().min_by_key(|event| event.received_at).cloned() {
+                consider(scope, event);
+            }
+        }
+        for (scope, events) in &self.withheld_native_steer {
+            if let Some(event) = events
+                .iter()
+                .min_by_key(|event| event.received_at)
+                .cloned()
+                .map(QueuedEvent::into_batch_event)
+            {
+                consider(scope, event);
+            }
+        }
+
+        let (scope, event) = candidate?;
+        let content = self.pending_nonretryable_notice.take()?;
+        Some((
+            FlushBatch {
+                channel_id: scope.channel_id(),
+                scope,
+                events: vec![event],
+                cancelled_events: vec![],
+                cancel_reason: None,
+            },
+            content,
+        ))
     }
 
     /// Retain a batch after a non-retryable provider failure.
@@ -701,7 +785,10 @@ impl EventQueue {
     /// account. Keeping the full [`FlushBatch`] also preserves interrupted-event
     /// context instead of silently treating the failed turn as complete.
     pub fn quarantine_nonretryable(&mut self, batch: FlushBatch) {
-        self.pause_nonretryable_dispatch();
+        debug_assert!(
+            self.nonretryable_dispatch_paused,
+            "non-retryable batches must pause automatic dispatch first"
+        );
         let scope = batch.scope.clone();
         self.retry_after.remove(&scope);
         self.retry_counts.remove(&scope);
@@ -2521,6 +2608,26 @@ mod tests {
             received_at: Instant::now(),
             prompt_tag: "test".into(),
         }
+    }
+
+    #[test]
+    fn pending_nonretryable_notice_skips_removed_channel() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let channel_id = Uuid::new_v4();
+        assert!(q.push(make_queued(channel_id, "waiting request")));
+        assert!(q.pause_nonretryable_dispatch("sanitized notice".to_string()));
+
+        let removed = HashSet::from([channel_id]);
+        assert!(q
+            .take_nonretryable_notice_for_pending_batch(&removed)
+            .is_none());
+
+        let (batch, notice) = q
+            .take_nonretryable_notice_for_pending_batch(&HashSet::new())
+            .expect("the retained notice must remain available for an eligible channel");
+        assert_eq!(batch.channel_id, channel_id);
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(notice, "sanitized notice");
     }
 
     // ── Step 2: scope partitioning ──────────────────────────────────────────
