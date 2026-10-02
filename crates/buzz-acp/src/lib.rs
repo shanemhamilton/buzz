@@ -2107,19 +2107,22 @@ impl SlotCircuit {
     /// does NOT record a new crash — it only checks whether the circuit
     /// allows a respawn attempt.
     ///
-    /// Returns `true` if respawn is allowed. For half-open probes, pre-seeds
-    /// crash_times so the next crash re-opens immediately. For normal refills
-    /// (no circuit was ever opened), crash history is preserved so the breaker
-    /// can still trip if the refilled agent crashes quickly.
+    /// Returns `true` if respawn is allowed. Ordinary half-open probes pre-seed
+    /// `crash_times` so the next crash re-opens immediately. A planned worker
+    /// replacement that failed initialization keeps its saved settings and
+    /// prior crash history instead: its cooldown throttles retries without
+    /// charging a crash that did not happen.
     fn can_refill(&mut self) -> bool {
         let now = std::time::Instant::now();
         match self.open_until {
             Some(open_until) => {
                 if now >= open_until {
-                    // Half-open probe: pre-seed crash_times.
-                    self.crash_times.clear();
-                    for _ in 0..(CIRCUIT_BREAKER_THRESHOLD - 1) {
-                        self.crash_times.push(now);
+                    if self.recycled_settings.is_none() {
+                        // Ordinary half-open probe: pre-seed crash_times.
+                        self.crash_times.clear();
+                        for _ in 0..(CIRCUIT_BREAKER_THRESHOLD - 1) {
+                            self.crash_times.push(now);
+                        }
                     }
                     self.open_until = None;
                     true
@@ -2408,9 +2411,10 @@ fn complete_respawn_result(
         }
         Err(error) => {
             if crash_history[rr.index].recycled_settings.is_some() {
+                crash_history[rr.index].mark_spawn_failed();
                 tracing::warn!(
                     agent = rr.index,
-                    "planned worker recycle failed: {error} — maintenance will retry"
+                    "planned worker recycle failed: {error} — maintenance will retry after cooldown"
                 );
             } else {
                 crash_history[rr.index].mark_spawn_failed();
@@ -13050,8 +13054,8 @@ mod session_resource_tests {
         respawn_tasks.shutdown().await;
     }
 
-    #[test]
-    fn planned_recycle_keeps_runtime_state_after_replacement_failure() {
+    #[tokio::test]
+    async fn planned_recycle_failure_cools_down_then_restores_runtime_state() {
         let settings = RecycledAgentSettings {
             desired_model: Some("runtime-model".into()),
             model_overridden: true,
@@ -13059,13 +13063,15 @@ mod session_resource_tests {
             desired_model_pending_ack: true,
             startup_effort: Some("high".into()),
         };
+        let prior_crash = std::time::Instant::now() - Duration::from_secs(1);
         let mut pool = AgentPool::from_slots(vec![None]);
         let mut crash_history = vec![SlotCircuit {
-            crash_times: Vec::new(),
+            crash_times: vec![prior_crash],
             open_until: None,
             respawn_in_flight: true,
             recycled_settings: Some(settings),
         }];
+        let config = test_config();
 
         assert!(!complete_respawn_result(
             &mut pool,
@@ -13074,8 +13080,16 @@ mod session_resource_tests {
                 index: 0,
                 result: Err(anyhow::anyhow!("replacement initialize failed")),
             },
-            &test_config(),
+            &config,
         ));
+        assert!(
+            crash_history[0].open_until.is_some(),
+            "a failed planned replacement must enter the bounded cooldown"
+        );
+        assert!(
+            !crash_history[0].can_refill(),
+            "maintenance must not retry a planned replacement before cooldown"
+        );
         let saved = crash_history[0]
             .recycled_settings
             .as_ref()
@@ -13085,8 +13099,52 @@ mod session_resource_tests {
         assert_eq!(saved.desired_model_request_id.as_deref(), Some("pick-42"));
         assert!(saved.desired_model_pending_ack);
         assert_eq!(saved.startup_effort.as_deref(), Some("high"));
-        assert!(crash_history[0].crash_times.is_empty());
+        assert_eq!(crash_history[0].crash_times.as_slice(), &[prior_crash]);
         assert!(!crash_history[0].respawn_in_flight);
+
+        // SlotCircuit deliberately uses std::time::Instant, which Tokio's
+        // paused time does not advance. Expire the cooldown directly to reach
+        // the same maintenance refill branch deterministically.
+        crash_history[0].open_until = Some(std::time::Instant::now() - Duration::from_secs(1));
+        assert!(
+            crash_history[0].can_refill(),
+            "maintenance must retry the planned replacement after cooldown"
+        );
+        assert_eq!(
+            crash_history[0].crash_times.as_slice(),
+            &[prior_crash],
+            "planned replacement cooldown must not reseed crash history"
+        );
+        assert!(crash_history[0].recycled_settings.is_some());
+
+        assert!(complete_respawn_result(
+            &mut pool,
+            &mut crash_history,
+            RespawnResult {
+                index: 0,
+                result: Ok((
+                    AcpClient::spawn("cat", &[], &[], false)
+                        .await
+                        .expect("spawn replacement fixture"),
+                    1,
+                    "antigravity-acp".into(),
+                )),
+            },
+            &config,
+        ));
+        let mut replacement = pool.agents_mut()[0]
+            .take()
+            .expect("eventual replacement must return to the pool");
+        assert_eq!(replacement.desired_model.as_deref(), Some("runtime-model"));
+        assert!(replacement.model_overridden);
+        assert_eq!(
+            replacement.desired_model_request_id.as_deref(),
+            Some("pick-42")
+        );
+        assert!(replacement.desired_model_pending_ack);
+        assert_eq!(replacement.startup_effort.as_deref(), Some("high"));
+        assert!(crash_history[0].recycled_settings.is_none());
+        replacement.acp.shutdown().await;
     }
 }
 

@@ -500,7 +500,7 @@ impl EventQueue {
         // those as a regular batch (re-dispatch unchanged).
         let scope = match scope {
             Some(scope) => scope,
-            None => {
+            None => loop {
                 let cancelled_scope = self
                     .cancelled_batches
                     .keys()
@@ -510,99 +510,94 @@ impl EventQueue {
                             && self.retry_after.get(*scope).is_none_or(|&t| t <= now)
                     })
                     .cloned();
-                match cancelled_scope {
-                    Some(scope) => {
-                        // A cancelled batch normally re-prompts immediately,
-                        // but repeated steer/cancel fallbacks used to bypass
-                        // retry accounting entirely. Reuse the normal backoff
-                        // schedule and dead-letter after a bounded number of
-                        // redispatches so an interrupted provider turn cannot
-                        // create fresh sessions forever.
-                        let channel_id = scope.channel_id();
-                        if let Some(&deadline) = self.retry_after.get(&scope) {
-                            if now < deadline {
-                                return None;
-                            }
-                        }
-                        let attempt = {
-                            let count = self
-                                .cancelled_redispatch_counts
-                                .entry(scope.clone())
-                                .or_insert(0);
-                            *count += 1;
-                            *count
-                        };
-                        if attempt > MAX_CANCELLED_REDISPATCHES {
-                            let cancelled =
-                                self.cancelled_batches.remove(&scope).unwrap_or_default();
-                            self.cancel_reasons.remove(&scope);
-                            self.cancelled_redispatch_counts.remove(&scope);
-                            // Fresh work for this scope must not inherit the
-                            // discarded batch's throttle or ordinary retries.
-                            self.retry_after.remove(&scope);
-                            self.retry_counts.remove(&scope);
-                            tracing::error!(
-                                channel_id = %channel_id,
-                                scope = %scope.telemetry_label(),
-                                attempt,
-                                events = cancelled.len(),
-                                "dead-lettering cancelled batch after {} cancel+merge redispatches — discarding {} events",
-                                MAX_CANCELLED_REDISPATCHES,
-                                cancelled.len(),
-                            );
-                            self.dead_letters.push(FlushBatch {
-                                channel_id,
-                                scope,
-                                events: cancelled,
-                                cancelled_events: vec![],
-                                cancel_reason: None,
-                            });
-                            return None;
-                        }
-                        // Preserve the immediate first re-prompt for a normal
-                        // cancel. Repeated interruptions back off like
-                        // `requeue()` so they cannot spin at provider speed.
-                        if attempt > 1 {
-                            let base_secs =
-                                BASE_RETRY_DELAY_SECS.saturating_mul(1u64 << (attempt - 1).min(6));
-                            let capped_secs = base_secs.min(MAX_RETRY_DELAY_SECS);
-                            let nanos = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .subsec_nanos();
-                            let jitter = 0.8 + (nanos as f64 / u32::MAX as f64) * 0.4;
-                            let delay = Duration::from_secs_f64(capped_secs as f64 * jitter);
-                            self.retry_after.insert(scope.clone(), now + delay);
-                        }
-                        tracing::warn!(
-                            channel_id = %channel_id,
-                            scope = %scope.telemetry_label(),
-                            attempt,
-                            max = MAX_CANCELLED_REDISPATCHES,
-                            "flushing cancelled batch via fallback (cancel+merge redispatch {} of {})",
-                            attempt,
-                            MAX_CANCELLED_REDISPATCHES,
-                        );
-                        // Move cancelled events into the regular events slot.
-                        // No new events to merge — re-dispatch the original batch.
-                        let cancelled = self.cancelled_batches.remove(&scope).unwrap_or_default();
-                        let cancel_reason = self.cancel_reasons.remove(&scope);
-                        self.in_flight_scopes.insert(scope.clone());
-                        self.in_flight_deadlines
-                            .insert(scope.clone(), now + self.in_flight_deadline);
-                        self.in_flight_batch_sizes
-                            .insert(scope.clone(), cancelled.len());
-                        return Some(FlushBatch {
-                            channel_id: scope.channel_id(),
-                            scope,
-                            events: cancelled,
-                            cancelled_events: vec![],
-                            cancel_reason,
-                        });
-                    }
-                    None => return None,
+                let Some(scope) = cancelled_scope else {
+                    return None;
+                };
+                // A cancelled batch normally re-prompts immediately, but
+                // repeated steer/cancel fallbacks used to bypass retry
+                // accounting entirely. Reuse the normal backoff schedule and
+                // dead-letter after a bounded number of redispatches so an
+                // interrupted provider turn cannot create fresh sessions
+                // forever.
+                let channel_id = scope.channel_id();
+                let attempt = {
+                    let count = self
+                        .cancelled_redispatch_counts
+                        .entry(scope.clone())
+                        .or_insert(0);
+                    *count += 1;
+                    *count
+                };
+                if attempt > MAX_CANCELLED_REDISPATCHES {
+                    let cancelled = self.cancelled_batches.remove(&scope).unwrap_or_default();
+                    self.cancel_reasons.remove(&scope);
+                    self.cancelled_redispatch_counts.remove(&scope);
+                    // Fresh work for this scope must not inherit the
+                    // discarded batch's throttle or ordinary retries.
+                    self.retry_after.remove(&scope);
+                    self.retry_counts.remove(&scope);
+                    tracing::error!(
+                        channel_id = %channel_id,
+                        scope = %scope.telemetry_label(),
+                        attempt,
+                        events = cancelled.len(),
+                        "dead-lettering cancelled batch after {} cancel+merge redispatches — discarding {} events",
+                        MAX_CANCELLED_REDISPATCHES,
+                        cancelled.len(),
+                    );
+                    self.dead_letters.push(FlushBatch {
+                        channel_id,
+                        scope,
+                        events: cancelled,
+                        cancelled_events: vec![],
+                        cancel_reason: None,
+                    });
+                    // Removing this scope guarantees a finite search:
+                    // another ready cancelled scope can still dispatch
+                    // during this same flush cycle.
+                    continue;
                 }
-            }
+                // Preserve the immediate first re-prompt for a normal
+                // cancel. Repeated interruptions back off like
+                // `requeue()` so they cannot spin at provider speed.
+                if attempt > 1 {
+                    let base_secs =
+                        BASE_RETRY_DELAY_SECS.saturating_mul(1u64 << (attempt - 1).min(6));
+                    let capped_secs = base_secs.min(MAX_RETRY_DELAY_SECS);
+                    let nanos = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .subsec_nanos();
+                    let jitter = 0.8 + (nanos as f64 / u32::MAX as f64) * 0.4;
+                    let delay = Duration::from_secs_f64(capped_secs as f64 * jitter);
+                    self.retry_after.insert(scope.clone(), now + delay);
+                }
+                tracing::warn!(
+                    channel_id = %channel_id,
+                    scope = %scope.telemetry_label(),
+                    attempt,
+                    max = MAX_CANCELLED_REDISPATCHES,
+                    "flushing cancelled batch via fallback (cancel+merge redispatch {} of {})",
+                    attempt,
+                    MAX_CANCELLED_REDISPATCHES,
+                );
+                // Move cancelled events into the regular events slot.
+                // No new events to merge — re-dispatch the original batch.
+                let cancelled = self.cancelled_batches.remove(&scope).unwrap_or_default();
+                let cancel_reason = self.cancel_reasons.remove(&scope);
+                self.in_flight_scopes.insert(scope.clone());
+                self.in_flight_deadlines
+                    .insert(scope.clone(), now + self.in_flight_deadline);
+                self.in_flight_batch_sizes
+                    .insert(scope.clone(), cancelled.len());
+                return Some(FlushBatch {
+                    channel_id: scope.channel_id(),
+                    scope,
+                    events: cancelled,
+                    cancelled_events: vec![],
+                    cancel_reason,
+                });
+            },
         };
         let channel_id = scope.channel_id();
 
@@ -5870,6 +5865,45 @@ mod tests {
             "all throttled cancelled scopes must wait for their retry deadline"
         );
         assert!(q.flush_next().is_none());
+    }
+
+    #[test]
+    fn test_exhausted_cancelled_scope_does_not_mask_ready_scope() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let first_channel = Uuid::new_v4();
+        let second_channel = Uuid::new_v4();
+
+        for (channel_id, content) in [(first_channel, "first"), (second_channel, "second")] {
+            q.push(make_queued(channel_id, content));
+            let batch = q.flush_next().expect("initial flush");
+            q.requeue_as_cancelled(batch, CancelReason::Steer);
+            q.mark_complete(channel_id);
+        }
+
+        // Select the map's actual first scope so this fails deterministically
+        // with the prior one-shot fallback selection.
+        let exhausted_scope = q
+            .cancelled_batches
+            .keys()
+            .next()
+            .expect("two cancelled scopes")
+            .clone();
+        let ready_scope = q
+            .cancelled_batches
+            .keys()
+            .find(|scope| **scope != exhausted_scope)
+            .expect("second cancelled scope")
+            .clone();
+        q.cancelled_redispatch_counts
+            .insert(exhausted_scope.clone(), MAX_CANCELLED_REDISPATCHES);
+
+        // The same call parks the exhausted batch and still returns the other
+        // ready batch, without waiting for a later maintenance cycle.
+        let ready = q.flush_next().expect("ready scope must flush");
+        assert_eq!(ready.scope, ready_scope);
+        let dead = q.take_dead_letters();
+        assert_eq!(dead.len(), 1, "exhausted batch parked for notice");
+        assert_eq!(dead[0].scope, exhausted_scope);
     }
 
     #[test]
