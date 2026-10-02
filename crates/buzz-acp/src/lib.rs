@@ -2129,10 +2129,105 @@ impl SlotCircuit {
     }
 }
 
-/// True if any slot has a respawn task in flight. Used to prevent premature
-/// "all agents dead" exits — a respawning agent may succeed in seconds.
+/// True if any slot has a respawn task in flight.
 fn any_respawn_in_flight(crash_history: &[SlotCircuit]) -> bool {
     crash_history.iter().any(|s| s.respawn_in_flight)
+}
+
+/// True while at least one empty slot has a bounded path back to service.
+///
+/// A circuit-open slot is intentionally unavailable, not permanently dead:
+/// maintenance performs one half-open refill after its cooldown. Treating it
+/// as dead exits the outer harness before that recovery can run.
+fn has_scheduled_slot_recovery(crash_history: &[SlotCircuit]) -> bool {
+    any_respawn_in_flight(crash_history)
+        || crash_history.iter().any(|slot| slot.open_until.is_some())
+}
+
+/// Build the bounded tick that drives queue compaction and circuit recovery.
+///
+/// The first tick is one full interval out, so an otherwise quiet harness
+/// sleeps instead of immediately re-running maintenance after every event.
+fn maintenance_tick(interval: Duration) -> tokio::time::Interval {
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tick
+}
+
+#[cfg(test)]
+mod circuit_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn cooldown_defers_refill_then_allows_one_half_open_probe() {
+        let mut slot = SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: Some(std::time::Instant::now() + Duration::from_secs(60)),
+            respawn_in_flight: false,
+        };
+
+        assert!(
+            !slot.can_refill(),
+            "an open circuit must not respawn before its cooldown"
+        );
+
+        slot.open_until = Some(std::time::Instant::now() - Duration::from_secs(1));
+        assert!(
+            slot.can_refill(),
+            "the cooldown must permit one half-open refill"
+        );
+        assert_eq!(slot.crash_times.len(), CIRCUIT_BREAKER_THRESHOLD - 1);
+        assert!(matches!(slot.record_crash(), CrashVerdict::CircuitOpen));
+        assert!(
+            slot.open_until.is_some(),
+            "a failed half-open probe must re-open the cooldown"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn maintenance_tick_wakes_quiet_half_open_refill_once_due() {
+        let mut slot = SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: Some(std::time::Instant::now() + Duration::from_secs(300)),
+            respawn_in_flight: false,
+        };
+        assert!(
+            !slot.can_refill(),
+            "a circuit-open slot must not retry before its cooldown"
+        );
+
+        let tick = maintenance_tick(Duration::from_secs(30));
+        let waiter = tokio::spawn(async move {
+            let mut tick = tick;
+            tick.tick().await;
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "maintenance must not run at startup");
+
+        tokio::time::advance(Duration::from_secs(29)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "quiet recovery must wait for the bounded maintenance interval"
+        );
+
+        // SlotCircuit intentionally uses std::time::Instant, which Tokio's
+        // paused clock does not advance. Expire it manually, then verify the
+        // production timer seam reaches exactly one eligible refill.
+        slot.open_until = Some(std::time::Instant::now() - Duration::from_secs(1));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        waiter.await.expect("maintenance tick task must complete");
+        let mut refill_attempts = 0;
+        if !slot.respawn_in_flight && slot.can_refill() {
+            slot.respawn_in_flight = true;
+            refill_attempts += 1;
+        }
+        if !slot.respawn_in_flight && slot.can_refill() {
+            refill_attempts += 1;
+        }
+        assert_eq!(refill_attempts, 1, "only one half-open refill may start");
+    }
 }
 
 /// Result of a background respawn task.
@@ -3000,11 +3095,14 @@ async fn run_harness(
         ))
     };
 
-    // Runs at the TOP of every loop iteration via Instant check — cannot be
-    // starved by the biased select. Slot refill spawns background tasks so
-    // spawn_and_init never blocks the main loop.
+    // Runs at the top of every loop iteration. A dedicated tick wakes quiet
+    // harnesses, so a circuit-open slot reaches its half-open refill even when
+    // presence, typing, heartbeats, inactivity, and relay traffic are idle.
+    // Slot refill spawns background tasks so spawn_and_init never blocks the
+    // main loop.
     let maintenance_interval = Duration::from_secs(30);
-    let mut last_maintenance = std::time::Instant::now();
+    let mut last_maintenance = tokio::time::Instant::now();
+    let mut maintenance_recovery_tick = maintenance_tick(maintenance_interval);
 
     // Channel for background respawn tasks to return completed agents.
     // Bounded to agent count — at most one respawn per slot in flight.
@@ -3124,7 +3222,7 @@ async fn run_harness(
         }
 
         if pool_ready && last_maintenance.elapsed() >= maintenance_interval {
-            last_maintenance = std::time::Instant::now();
+            last_maintenance = tokio::time::Instant::now();
             queue.compact_expired_state();
 
             // Slot refill: spawn background tasks for empty slots whose
@@ -3269,6 +3367,10 @@ async fn run_harness(
                         _ => std::future::pending().await,
                     }
                 } => None,
+                _ = maintenance_recovery_tick.tick(), if pool_ready => {
+                    let _ = result_rx;
+                    None
+                },
                 _ = pool::AgentPool::wait_for_hold_deadline(hold_deadline), if pool_ready => {
                     Some(PoolEvent::HoldDeadline)
                 },
@@ -3895,7 +3997,7 @@ async fn run_harness(
                     &mut respawn_tasks,
                     observer.clone(),
                 );
-                if pool.live_count() == 0 && !any_respawn_in_flight(&crash_history) {
+                if pool.live_count() == 0 && !has_scheduled_slot_recovery(&crash_history) {
                     tracing::error!("all agents dead — exiting");
                     break;
                 }
@@ -5438,20 +5540,14 @@ fn handle_prompt_result(
 
             let index = result.agent.index;
             let slot_history = &mut crash_history[index];
-            if !spawn_respawn_task(
+            spawn_respawn_task(
                 result.agent,
                 config,
                 slot_history,
                 respawn_tx,
                 respawn_tasks,
                 observer.clone(),
-            ) {
-                // Circuit open — slot stays empty until maintenance refill.
-                if pool.live_count() == 0 && !any_respawn_in_flight(crash_history) {
-                    tracing::error!("all agents dead — exiting");
-                    return LoopAction::Exit;
-                }
-            }
+            );
         }
         // Cancel-drain expiry: a control-signal cancel (steer fallback,
         // interrupt, or explicit stop) did not drain within its bounded
@@ -5478,20 +5574,14 @@ fn handle_prompt_result(
 
             let index = result.agent.index;
             let slot_history = &mut crash_history[index];
-            if !spawn_respawn_task(
+            spawn_respawn_task(
                 result.agent,
                 config,
                 slot_history,
                 respawn_tx,
                 respawn_tasks,
                 observer.clone(),
-            ) {
-                // Circuit open — slot stays empty until maintenance refill.
-                if pool.live_count() == 0 && !any_respawn_in_flight(crash_history) {
-                    tracing::error!("all agents dead — exiting");
-                    return LoopAction::Exit;
-                }
-            }
+            );
         }
         // Errors fall into two categories:
         //
@@ -5553,19 +5643,14 @@ fn handle_prompt_result(
 
                 let index = result.agent.index;
                 let slot_history = &mut crash_history[index];
-                if !spawn_respawn_task(
+                spawn_respawn_task(
                     result.agent,
                     config,
                     slot_history,
                     respawn_tx,
                     respawn_tasks,
                     observer,
-                ) && pool.live_count() == 0
-                    && !any_respawn_in_flight(crash_history)
-                {
-                    tracing::error!("all agents dead — exiting");
-                    return LoopAction::Exit;
-                }
+                );
             } else {
                 if let Some(failure) = nonretryable_failure {
                     tracing::warn!(
@@ -5738,7 +5823,7 @@ fn drain_ready_join_results(
                 respawn_tasks,
                 observer.clone(),
             );
-            if pool.live_count() == 0 && !any_respawn_in_flight(crash_history) {
+            if pool.live_count() == 0 && !has_scheduled_slot_recovery(crash_history) {
                 return LoopAction::Exit;
             }
         }
@@ -11394,6 +11479,97 @@ mod error_outcome_emission_tests {
             1,
             "exactly one turn_error event must be emitted"
         );
+    }
+
+    /// A circuit-open slot has a scheduled half-open recovery. A
+    /// cancel-drain timeout must preserve its accepted batch and leave the
+    /// outer harness alive for maintenance, rather than converting the
+    /// temporary cooldown into a clean process exit.
+    #[tokio::test]
+    async fn cancel_drain_timeout_with_open_circuit_waits_for_maintenance() {
+        let event = EventBuilder::new(Kind::Custom(9), "original")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let channel_id = Uuid::new_v4();
+        let batch = FlushBatch {
+            channel_id,
+            scope: scope::SessionScope::Conversation { channel_id },
+            events: vec![BatchEvent {
+                edit: None,
+                event: event.clone(),
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: Some(CancelReason::Steer),
+        };
+
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: None,
+                scope: None,
+                turn_id: "test-turn-id".to_string(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: Some(std::time::Instant::now() + Duration::from_secs(300)),
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
+            turn_id: "test-turn-id".to_string(),
+            outcome: PromptOutcome::CancelDrainTimeout(Duration::from_secs(5)),
+            batch: Some(batch),
+        };
+
+        assert!(matches!(
+            handle_prompt_result(
+                &mut pool,
+                &mut queue,
+                &config,
+                result,
+                &mut heartbeat_in_flight,
+                &removed_channels,
+                &mut crash_history,
+                &respawn_tx,
+                &mut respawn_tasks,
+                None,
+                None,
+            ),
+            LoopAction::Continue
+        ));
+
+        assert_eq!(pool.live_count(), 0, "poisoned agent must not return idle");
+        assert!(
+            respawn_tasks.is_empty(),
+            "the open circuit must defer respawn until maintenance"
+        );
+        assert!(
+            has_scheduled_slot_recovery(&crash_history),
+            "the outer harness must recognize the pending half-open recovery"
+        );
+
+        let requeued = queue.flush_next().expect("accepted batch must be retained");
+        assert_eq!(requeued.cancelled_events.len(), 1);
+        assert_eq!(requeued.cancelled_events[0].event.id, event.id);
+        assert_eq!(requeued.cancel_reason, Some(CancelReason::Steer));
     }
 
     /// Explicit Stop (`ControlSignal::Cancel`) on cancel-drain expiry drops
