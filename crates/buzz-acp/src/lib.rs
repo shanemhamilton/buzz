@@ -11567,8 +11567,19 @@ mod error_outcome_emission_tests {
         );
 
         let requeued = queue.flush_next().expect("accepted batch must be retained");
-        assert_eq!(requeued.cancelled_events.len(), 1);
-        assert_eq!(requeued.cancelled_events[0].event.id, event.id);
+        assert_eq!(
+            requeued.events.len(),
+            1,
+            "a lone cancelled batch must be redelivered as the next regular batch"
+        );
+        assert_eq!(
+            requeued.events[0].event.id, event.id,
+            "the retained batch must contain the original accepted event"
+        );
+        assert!(
+            requeued.cancelled_events.is_empty(),
+            "without a newer queued event there is nothing to merge with the cancelled batch"
+        );
         assert_eq!(requeued.cancel_reason, Some(CancelReason::Steer));
     }
 
