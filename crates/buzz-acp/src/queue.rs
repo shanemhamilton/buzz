@@ -510,9 +510,7 @@ impl EventQueue {
                             && self.retry_after.get(*scope).is_none_or(|&t| t <= now)
                     })
                     .cloned();
-                let Some(scope) = cancelled_scope else {
-                    return None;
-                };
+                let scope = cancelled_scope?;
                 // A cancelled batch normally re-prompts immediately, but
                 // repeated steer/cancel fallbacks used to bypass retry
                 // accounting entirely. Reuse the normal backoff schedule and
