@@ -522,7 +522,9 @@ test("workflow grid batches card author and message presentation reads", async (
   await page.getByTestId("open-workflows-view").click();
   await expect(
     page
-      .locator('[data-testid^="workflow-card-"]')
+      .locator(
+        '[data-testid^="workflow-card-"]:has([data-testid="workflow-card-name"])',
+      )
       .filter({ hasText: "batched_card_" }),
   ).toHaveCount(40);
   await expect
