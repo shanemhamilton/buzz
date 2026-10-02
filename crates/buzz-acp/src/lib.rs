@@ -2020,7 +2020,7 @@ const RESPAWN_MAX_DELAY: Duration = Duration::from_secs(30);
 /// instant, then allows one probe respawn (half-open). If the probe crashes, the
 /// circuit re-opens for another `CIRCUIT_BREAKER_COOLDOWN` period.
 ///
-/// All state transitions go through methods on this struct — callers never
+/// Crash state transitions go through methods on this struct — callers never
 /// manipulate `crash_times` or `open_until` directly.
 struct SlotCircuit {
     crash_times: Vec<std::time::Instant>,
@@ -2029,6 +2029,9 @@ struct SlotCircuit {
     /// Prevents duplicate spawns from maintenance ticks that fire before the
     /// previous spawn_and_init completes.
     respawn_in_flight: bool,
+    /// Live worker settings held across a planned recycle, including a failed
+    /// replacement attempt. Crash recovery intentionally leaves this empty.
+    recycled_settings: Option<RecycledAgentSettings>,
 }
 
 /// Result of [`SlotCircuit::record_crash`].
@@ -2164,6 +2167,7 @@ mod circuit_recovery_tests {
             crash_times: Vec::new(),
             open_until: Some(std::time::Instant::now() + Duration::from_secs(60)),
             respawn_in_flight: false,
+            recycled_settings: None,
         };
 
         assert!(
@@ -2190,6 +2194,7 @@ mod circuit_recovery_tests {
             crash_times: Vec::new(),
             open_until: Some(std::time::Instant::now() + Duration::from_secs(300)),
             respawn_in_flight: false,
+            recycled_settings: None,
         };
         assert!(
             !slot.can_refill(),
@@ -2235,6 +2240,31 @@ struct RespawnResult {
     index: usize,
     /// Tuple: (initialized client, protocol version, agent name).
     result: Result<(AcpClient, u32, String)>,
+}
+
+/// Runtime-only settings held by a worker after a live model selection.
+///
+/// A planned recycle deliberately replaces a healthy process, so it carries
+/// these values to the fresh worker just as a fresh session would. Session
+/// state itself is intentionally not retained across a process boundary.
+struct RecycledAgentSettings {
+    desired_model: Option<String>,
+    model_overridden: bool,
+    desired_model_request_id: Option<String>,
+    desired_model_pending_ack: bool,
+    startup_effort: Option<String>,
+}
+
+impl RecycledAgentSettings {
+    fn capture(agent: &OwnedAgent) -> Self {
+        Self {
+            desired_model: agent.desired_model.clone(),
+            model_overridden: agent.model_overridden,
+            desired_model_request_id: agent.desired_model_request_id.clone(),
+            desired_model_pending_ack: agent.desired_model_pending_ack,
+            startup_effort: agent.startup_effort.clone(),
+        }
+    }
 }
 
 /// Outcome of a non-cancelling steer attempt, forwarded from a per-attempt
@@ -2314,6 +2344,82 @@ impl Drop for RespawnGuard {
                 index: self.index,
                 result: Err(anyhow::anyhow!("respawn task panicked or was cancelled")),
             });
+        }
+    }
+}
+
+fn respawned_agent(
+    index: usize,
+    acp: AcpClient,
+    protocol_version: u32,
+    agent_name: String,
+    recycled_settings: Option<RecycledAgentSettings>,
+    config: &Config,
+) -> OwnedAgent {
+    let settings = recycled_settings.unwrap_or_else(|| RecycledAgentSettings {
+        desired_model: config.model.clone(),
+        model_overridden: false,
+        desired_model_request_id: None,
+        desired_model_pending_ack: false,
+        startup_effort: config.effort_level.clone(),
+    });
+    OwnedAgent {
+        index,
+        acp,
+        state: SessionState::default(),
+        model_capabilities: None,
+        desired_model: settings.desired_model,
+        model_overridden: settings.model_overridden,
+        desired_model_request_id: settings.desired_model_request_id,
+        desired_model_pending_ack: settings.desired_model_pending_ack,
+        startup_effort: settings.startup_effort,
+        agent_name,
+        goose_system_prompt_supported: None,
+        protocol_version,
+    }
+}
+
+/// Rejoin a completed replacement with its slot.
+///
+/// Planned recycle settings stay on the slot until initialization succeeds, so
+/// a failed replacement can wait for maintenance without losing a live model
+/// selection or deferred acknowledgement.
+fn complete_respawn_result(
+    pool: &mut AgentPool,
+    crash_history: &mut [SlotCircuit],
+    rr: RespawnResult,
+    config: &Config,
+) -> bool {
+    crash_history[rr.index].respawn_in_flight = false;
+    match rr.result {
+        Ok((acp, protocol_version, agent_name)) => {
+            let recycled_settings = crash_history[rr.index].recycled_settings.take();
+            let agent = respawned_agent(
+                rr.index,
+                acp,
+                protocol_version,
+                agent_name,
+                recycled_settings,
+                config,
+            );
+            pool.return_agent(agent);
+            tracing::info!(agent = rr.index, "respawn complete");
+            true
+        }
+        Err(error) => {
+            if crash_history[rr.index].recycled_settings.is_some() {
+                tracing::warn!(
+                    agent = rr.index,
+                    "planned worker recycle failed: {error} — maintenance will retry"
+                );
+            } else {
+                crash_history[rr.index].mark_spawn_failed();
+                tracing::warn!(
+                    agent = rr.index,
+                    "respawn failed: {error} — circuit re-opened"
+                );
+            }
+            false
         }
     }
 }
@@ -2508,6 +2614,7 @@ mod idle_pool_sleep_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight,
+            recycled_settings: None,
         }
     }
 
@@ -3169,6 +3276,7 @@ async fn run_harness(
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            recycled_settings: None,
         })
         .collect();
 
@@ -3269,32 +3377,7 @@ async fn run_harness(
 
         let mut respawn_collected = false;
         while let Ok(rr) = respawn_rx.try_recv() {
-            crash_history[rr.index].respawn_in_flight = false;
-            match rr.result {
-                Ok((acp, protocol_version, agent_name)) => {
-                    let agent = OwnedAgent {
-                        index: rr.index,
-                        acp,
-                        state: SessionState::default(),
-                        model_capabilities: None,
-                        desired_model: config.model.clone(),
-                        model_overridden: false,
-                        desired_model_request_id: None,
-                        desired_model_pending_ack: false,
-                        startup_effort: config.effort_level.clone(),
-                        agent_name,
-                        goose_system_prompt_supported: None,
-                        protocol_version,
-                    };
-                    pool.return_agent(agent);
-                    tracing::info!(agent = rr.index, "respawn complete");
-                    respawn_collected = true;
-                }
-                Err(e) => {
-                    crash_history[rr.index].mark_spawn_failed();
-                    tracing::warn!(agent = rr.index, "respawn failed: {e} — circuit re-opened");
-                }
-            }
+            respawn_collected |= complete_respawn_result(&mut pool, &mut crash_history, rr, config);
         }
         // Reap completed respawn handles from the JoinSet. Payloads are
         // delivered out-of-band through `respawn_rx` (drained above), so the
@@ -5078,6 +5161,20 @@ fn dispatch_pending(
         queue.requeue_preserve_timestamps(batch);
         queue.mark_complete(scope);
     }
+    // Surface dead-lettered cancelled batches as user-visible failure notices.
+    // They are parked by `flush_next` (never returned as flushable batches, so
+    // they cannot be re-prompted); the notice is what `handle_prompt_result`
+    // would have posted for a normal dead-letter via `requeue()`.
+    for batch in queue.take_dead_letters() {
+        spawn_failure_notice(
+            Some(&ctx.rest_client),
+            &batch,
+            "⚠️ I couldn't process the last request after multiple cancel+merge \
+             redispatches (the turn kept getting interrupted). Please re-send \
+             if it's still needed."
+                .to_string(),
+        );
+    }
     tracing::debug!(
         dispatched = dispatched_channels.len(),
         queue_depth = queue.pending_channels(),
@@ -5511,7 +5608,15 @@ fn handle_prompt_result(
                 outcome = outcome_label,
                 "agent_returned"
             );
-            pool.return_agent(result.agent);
+            return_or_recycle_agent(
+                pool,
+                result.agent,
+                config,
+                crash_history,
+                respawn_tx,
+                respawn_tasks,
+                observer.clone(),
+            );
         }
         // Fatal outcomes: the agent subprocess is dead or poisoned — respawn it.
         PromptOutcome::AgentExited | PromptOutcome::Timeout(_) => {
@@ -5606,7 +5711,15 @@ fn handle_prompt_result(
                 pid = harness_pid,
                 "agent_returned (cancelled)"
             );
-            pool.return_agent(result.agent);
+            return_or_recycle_agent(
+                pool,
+                result.agent,
+                config,
+                crash_history,
+                respawn_tx,
+                respawn_tasks,
+                observer.clone(),
+            );
         }
         PromptOutcome::ProjectContextIndeterminate(reason) => {
             tracing::warn!(
@@ -5616,7 +5729,15 @@ fn handle_prompt_result(
                 "agent_returned (local project context indeterminate — pipe intact)"
             );
             emit_turn_error(&reason, None);
-            pool.return_agent(result.agent);
+            return_or_recycle_agent(
+                pool,
+                result.agent,
+                config,
+                crash_history,
+                respawn_tx,
+                respawn_tasks,
+                observer.clone(),
+            );
         }
         PromptOutcome::Error(ref e) => {
             let is_transport_error = matches!(
@@ -5673,7 +5794,15 @@ fn handle_prompt_result(
                     );
                     emit_turn_error(&e.to_string(), error_code);
                 }
-                pool.return_agent(result.agent);
+                return_or_recycle_agent(
+                    pool,
+                    result.agent,
+                    config,
+                    crash_history,
+                    respawn_tx,
+                    respawn_tasks,
+                    observer.clone(),
+                );
             }
         }
     }
@@ -6049,6 +6178,52 @@ fn spawn_respawn_task(
     });
 
     true
+}
+
+/// Replace a healthy worker after it reaches an adapter-specific session bound.
+///
+/// This only runs at a completed prompt boundary and does not call
+/// `SlotCircuit::record_crash`, so a planned recycle neither spends crash
+/// budget nor waits through crash backoff. Its result carries live model and
+/// effort state because the replacement is part of one logical worker lifetime.
+fn return_or_recycle_agent(
+    pool: &mut AgentPool,
+    agent: OwnedAgent,
+    config: &Config,
+    crash_history: &mut [SlotCircuit],
+    respawn_tx: &mpsc::Sender<RespawnResult>,
+    respawn_tasks: &mut tokio::task::JoinSet<()>,
+    observer: Option<observer::ObserverHandle>,
+) {
+    if !agent.acp.should_recycle_after_completed_prompt() {
+        pool.return_agent(agent);
+        return;
+    }
+
+    let index = agent.index;
+    debug_assert!(
+        !crash_history[index].respawn_in_flight,
+        "a completed worker cannot have another replacement in flight"
+    );
+    crash_history[index].respawn_in_flight = true;
+    crash_history[index].recycled_settings = Some(RecycledAgentSettings::capture(&agent));
+    let cmd = config.agent_command.clone();
+    let args = config.agent_args.clone();
+    let env = config.persona_env_vars.clone();
+    let has_codex = config.has_generated_codex_config;
+    let guard = RespawnGuard::new(index, respawn_tx.clone());
+    tracing::info!(
+        agent = index,
+        "recycling worker after session creation limit"
+    );
+    respawn_tasks.spawn(async move {
+        let mut agent = agent;
+        agent.acp.shutdown().await;
+        drop(agent);
+
+        let result = spawn_and_init(&cmd, &args, &env, has_codex, index, observer).await;
+        guard.send(result);
+    });
 }
 
 fn normalized_agent_name(init_result: &serde_json::Value) -> String {
@@ -10328,6 +10503,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            recycled_settings: None,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -10408,6 +10584,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            recycled_settings: None,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -10529,6 +10706,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            recycled_settings: None,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -10594,6 +10772,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            recycled_settings: None,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -10678,6 +10857,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            recycled_settings: None,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -10772,6 +10952,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: Some(std::time::Instant::now() + Duration::from_secs(3600)),
             respawn_in_flight: false,
+            recycled_settings: None,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -10865,6 +11046,7 @@ mod error_outcome_emission_tests {
                 crash_times: Vec::new(),
                 open_until: None,
                 respawn_in_flight: false,
+                recycled_settings: None,
             }];
             let (respawn_tx, _respawn_rx) = mpsc::channel(8);
             let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -10963,6 +11145,7 @@ mod error_outcome_emission_tests {
                 crash_times: Vec::new(),
                 open_until: None,
                 respawn_in_flight: false,
+                recycled_settings: None,
             }];
             let (respawn_tx, _respawn_rx) = mpsc::channel(8);
             let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -11072,6 +11255,7 @@ mod error_outcome_emission_tests {
                 crash_times: Vec::new(),
                 open_until: None,
                 respawn_in_flight: false,
+                recycled_settings: None,
             }];
             let (respawn_tx, _respawn_rx) = mpsc::channel(8);
             let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -11150,6 +11334,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            recycled_settings: None,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -11247,6 +11432,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            recycled_settings: None,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -11382,6 +11568,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            recycled_settings: None,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -11528,6 +11715,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: Some(std::time::Instant::now() + Duration::from_secs(300)),
             respawn_in_flight: false,
+            recycled_settings: None,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -11615,6 +11803,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            recycled_settings: None,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -11750,6 +11939,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            recycled_settings: None,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -11914,6 +12104,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            recycled_settings: None,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -12032,6 +12223,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            recycled_settings: None,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -12547,6 +12739,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            recycled_settings: None,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -12621,6 +12814,279 @@ mod error_outcome_emission_tests {
             !queue.has_flushable_work(),
             "non-retryable provider failure must have zero automatic retry attempts"
         );
+    }
+}
+
+#[cfg(test)]
+mod session_resource_tests {
+    use super::*;
+    use crate::acp::{AcpClient, StopReason};
+    use crate::pool::{AgentPool, OwnedAgent, PromptOutcome, PromptResult, PromptSource, TaskMeta};
+    use crate::queue::{EventQueue, QueuedEvent};
+    use nostr::{EventBuilder, Keys, Kind};
+    use std::collections::HashSet;
+
+    async fn recycle_ready_agent(index: usize) -> OwnedAgent {
+        let script = r#"
+            read -r _init
+            echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentInfo":{"name":"antigravity-acp"}}}'
+            session=0
+            while read -r request; do
+                id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+                printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"session-%s"}}\n' "$id" "$session"
+                session=$((session + 1))
+            done
+        "#;
+        let mut acp = AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
+            .await
+            .expect("spawn counted ACP fixture");
+        acp.initialize()
+            .await
+            .expect("counted ACP fixture initialize");
+        for _ in 0..acp::ANTIGRAVITY_ACP_SESSION_RECYCLE_LIMIT {
+            acp.session_new_full("/tmp", vec![], None, None)
+                .await
+                .expect("counted ACP fixture session/new");
+        }
+        OwnedAgent {
+            index,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: Some("runtime-model".into()),
+            model_overridden: true,
+            desired_model_request_id: Some("pick-42".into()),
+            desired_model_pending_ack: true,
+            startup_effort: Some("high".into()),
+            agent_name: "antigravity-acp".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+        }
+    }
+
+    fn test_config() -> Config {
+        let mut config = crate::build_mcp_servers_tests::test_config();
+        config.agent_command = "true".into();
+        config.agent_args = vec![];
+        config
+    }
+
+    fn register_completed_task(pool: &mut AgentPool, channel_id: Uuid) {
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                scope: Some(scope::SessionScope::Conversation { channel_id }),
+                turn_id: "recycle-test-turn".into(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn planned_recycle_after_success_keeps_queue_empty_and_crash_budget_unchanged() {
+        let agent = recycle_ready_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let channel_id = Uuid::new_v4();
+        register_completed_task(&mut pool, channel_id);
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+            recycled_settings: None,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(1);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            PromptResult {
+                agent,
+                source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
+                turn_id: "recycle-test-turn".into(),
+                outcome: PromptOutcome::Ok(StopReason::EndTurn),
+                batch: None,
+            },
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+            None,
+        );
+
+        assert!(
+            queue.flush_next().is_none(),
+            "a successful completed prompt must not be requeued during recycle"
+        );
+        assert!(
+            pool.agents_mut()[0].is_none(),
+            "the bounded worker must be replaced instead of returned idle"
+        );
+        assert_eq!(
+            respawn_tasks.len(),
+            1,
+            "recycle must use one replacement task"
+        );
+        assert!(
+            crash_history[0].crash_times.is_empty(),
+            "a planned recycle must not consume crash budget"
+        );
+        assert!(crash_history[0].respawn_in_flight);
+        respawn_tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn planned_recycle_preserves_cancelled_batch_and_runtime_model_state() {
+        let agent = recycle_ready_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let channel_id = Uuid::new_v4();
+        register_completed_task(&mut pool, channel_id);
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let event = EventBuilder::new(Kind::Custom(9), "cancelled work")
+            .sign_with_keys(&Keys::generate())
+            .expect("sign cancellation fixture");
+        let event_id = event.id.to_hex();
+        queue.push(QueuedEvent {
+            edit: None,
+            channel_id,
+            scope: scope::SessionScope::Conversation { channel_id },
+            event,
+            prompt_tag: "test".into(),
+            received_at: std::time::Instant::now(),
+        });
+        let batch = queue.flush_next().expect("fixture batch must dispatch");
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+            recycled_settings: None,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(1);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            PromptResult {
+                agent,
+                source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
+                turn_id: "recycle-test-turn".into(),
+                outcome: PromptOutcome::Cancelled,
+                batch: Some(batch),
+            },
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+            None,
+        );
+
+        let preserved = queue
+            .flush_next()
+            .expect("cancelled batch must survive planned recycle");
+        let preserved_ids: Vec<_> = preserved
+            .events
+            .iter()
+            .chain(&preserved.cancelled_events)
+            .map(|event| event.event.id.to_hex())
+            .collect();
+        assert_eq!(preserved_ids, [event_id]);
+        assert!(
+            crash_history[0].crash_times.is_empty(),
+            "a planned recycle must not consume crash budget"
+        );
+
+        assert!(complete_respawn_result(
+            &mut pool,
+            &mut crash_history,
+            RespawnResult {
+                index: 0,
+                result: Ok((
+                    AcpClient::spawn("cat", &[], &[], false)
+                        .await
+                        .expect("spawn replacement fixture"),
+                    1,
+                    "antigravity-acp".into(),
+                )),
+            },
+            &config,
+        ));
+        let replacement = pool.agents_mut()[0]
+            .take()
+            .expect("successful planned recycle must return its replacement");
+        assert_eq!(replacement.desired_model.as_deref(), Some("runtime-model"));
+        assert!(replacement.model_overridden);
+        assert_eq!(
+            replacement.desired_model_request_id.as_deref(),
+            Some("pick-42")
+        );
+        assert!(replacement.desired_model_pending_ack);
+        assert_eq!(replacement.startup_effort.as_deref(), Some("high"));
+        assert!(
+            crash_history[0].recycled_settings.is_none(),
+            "a successful replacement consumes the saved runtime state exactly once"
+        );
+        let mut replacement = replacement;
+        replacement.acp.shutdown().await;
+        respawn_tasks.shutdown().await;
+    }
+
+    #[test]
+    fn planned_recycle_keeps_runtime_state_after_replacement_failure() {
+        let settings = RecycledAgentSettings {
+            desired_model: Some("runtime-model".into()),
+            model_overridden: true,
+            desired_model_request_id: Some("pick-42".into()),
+            desired_model_pending_ack: true,
+            startup_effort: Some("high".into()),
+        };
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: true,
+            recycled_settings: Some(settings),
+        }];
+
+        assert!(!complete_respawn_result(
+            &mut pool,
+            &mut crash_history,
+            RespawnResult {
+                index: 0,
+                result: Err(anyhow::anyhow!("replacement initialize failed")),
+            },
+            &test_config(),
+        ));
+        let saved = crash_history[0]
+            .recycled_settings
+            .as_ref()
+            .expect("maintenance retry must retain planned replacement state");
+        assert_eq!(saved.desired_model.as_deref(), Some("runtime-model"));
+        assert!(saved.model_overridden);
+        assert_eq!(saved.desired_model_request_id.as_deref(), Some("pick-42"));
+        assert!(saved.desired_model_pending_ack);
+        assert_eq!(saved.startup_effort.as_deref(), Some("high"));
+        assert!(crash_history[0].crash_times.is_empty());
+        assert!(!crash_history[0].respawn_in_flight);
     }
 }
 
