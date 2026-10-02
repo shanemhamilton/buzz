@@ -1056,7 +1056,13 @@ test("card click opens the animated trigger inspector, triggers a run, and hides
   );
   await page.getByRole("button", { name: `View ${workflowName}` }).click();
 
-  await expect(page).toHaveURL(/#\/workflows\/[^?]+\?pane=trigger$/);
+  await expect(page).toHaveURL(/#\/workflows\/[^?]+\?.*pane=trigger/);
+  const workflowSearch = new URLSearchParams(
+    new URL(page.url()).hash.split("?")[1],
+  );
+  expect(workflowSearch.get("owner")).toBeTruthy();
+  expect(workflowSearch.get("channel")).toBeTruthy();
+  expect(workflowSearch.get("pane")).toBe("trigger");
   const detailDialog = page.getByRole("dialog", { name: "Edit workflow" });
   await expect(detailDialog).toBeVisible();
   await expect(detailDialog).toContainText(workflowName);
