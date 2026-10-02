@@ -8,7 +8,7 @@ type WorkflowEditorOverlayContextValue = {
   openNewWorkflow: ((channelId?: string) => void) | null;
   /** Opens an existing workflow over the current surface. Pass the workflow
    * when the caller already has it so the editor skips its loading state. */
-  openWorkflow: ((workflowId: string, workflow?: Workflow) => void) | null;
+  openWorkflow: ((workflow: Workflow) => void) | null;
 };
 
 const WorkflowEditorOverlayContext =
@@ -28,7 +28,7 @@ export function WorkflowEditorOverlayProvider({
 }: {
   children: React.ReactNode;
   onOpenNewWorkflow: (channelId?: string) => void;
-  onOpenWorkflow: (workflowId: string, workflow?: Workflow) => void;
+  onOpenWorkflow: (workflow: Workflow) => void;
 }) {
   const value = React.useMemo(
     () => ({

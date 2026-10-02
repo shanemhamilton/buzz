@@ -98,7 +98,7 @@ export function PersonaActionsMenu({
             }}
           >
             <Trash2 className="h-4 w-4" />
-            Delete
+            {persona.isBuiltIn ? "Remove from My Agents" : "Delete"}
           </DropdownMenuItem>
         )}
       </DropdownMenuContent>

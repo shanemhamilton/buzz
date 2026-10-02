@@ -2,6 +2,10 @@ import { useWorkflowQuery } from "@/features/workflows/hooks";
 import { WorkflowDialog } from "@/features/workflows/ui/WorkflowDialog";
 import { WorkflowUnavailableDialog } from "@/features/workflows/ui/WorkflowUnavailableDialog";
 import type { Channel, Workflow } from "@/shared/api/types";
+import {
+  workflowIdentityKey,
+  workflowMatchesReference,
+} from "@/shared/api/workflowTypes";
 import type { WorkflowEditorPane } from "./workflowEditorPane";
 
 /** Create target for the shared workflow editor. */
@@ -13,7 +17,9 @@ export type WorkflowEditorCreateTarget = {
 
 /** Existing-workflow target for the shared workflow editor. */
 export type WorkflowEditorWorkflowTarget = {
+  channelId: string | null;
   mode: "detail" | "duplicate" | "edit";
+  ownerPubkey: string;
   pane: WorkflowEditorPane;
   workflowId: string;
 };
@@ -32,8 +38,8 @@ type WorkflowEditorHostProps = {
   editor: WorkflowEditorTarget | null;
   onClose: () => void;
   onDeleteWorkflow: (workflow: Workflow) => void;
-  onDuplicateWorkflow: (workflowId: string) => void;
-  onEditWorkflow: (workflowId: string) => void;
+  onDuplicateWorkflow: (workflow: Workflow) => void;
+  onEditWorkflow: (workflow: Workflow) => void;
   onEditorPaneChange: (pane: WorkflowEditorPane) => void;
   onTriggerWorkflow: (workflowId: string) => void;
   /**
@@ -59,15 +65,28 @@ export function WorkflowEditorHost({
   onTriggerWorkflow,
   workflowHint,
 }: WorkflowEditorHostProps) {
-  const editorWorkflowId =
-    editor && editor.mode !== "create" ? editor.workflowId : null;
-  const editorWorkflowQuery = useWorkflowQuery(editorWorkflowId);
+  const editorWorkflowReference =
+    editor && editor.mode !== "create"
+      ? {
+          channelId: editor.channelId,
+          id: editor.workflowId,
+          ownerPubkey: editor.ownerPubkey,
+        }
+      : null;
+  const editorWorkflowQuery = useWorkflowQuery(editorWorkflowReference);
   const editorWorkflow =
-    workflowHint?.id === editorWorkflowId
+    workflowHint &&
+    editorWorkflowReference &&
+    workflowMatchesReference(workflowHint, editorWorkflowReference)
       ? workflowHint
       : editorWorkflowQuery.data;
 
   if (!editor) return null;
+
+  const dialogKey =
+    editor.mode !== "create" && editorWorkflowReference
+      ? `${editor.mode}:${workflowIdentityKey(editorWorkflowReference)}`
+      : editor.mode;
 
   if (editor.mode !== "create" && editorWorkflow === undefined) {
     return (
@@ -88,11 +107,7 @@ export function WorkflowEditorHost({
       initialChannelId={
         editor.mode === "create" ? editor.initialChannelId : undefined
       }
-      key={
-        editor.mode === "create"
-          ? editor.mode
-          : `${editor.mode}:${editor.workflowId}`
-      }
+      key={dialogKey}
       mode={editor.mode === "detail" ? "edit" : editor.mode}
       onDeleteWorkflow={onDeleteWorkflow}
       onDuplicateWorkflow={onDuplicateWorkflow}

@@ -2778,7 +2778,9 @@ test("built-in removal failures show up from My Agents", async ({ page }) => {
   });
 
   await page.getByLabel("Open actions for Honey").click();
-  await page.getByRole("menuitem", { name: "Delete" }).click();
+  await page
+    .getByRole("menuitem", { name: "Remove from My Agents", exact: true })
+    .click();
 
   await expect(
     page

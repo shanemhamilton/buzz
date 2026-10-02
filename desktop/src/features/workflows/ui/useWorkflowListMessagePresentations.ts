@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 
 import { getEventsByIds } from "@/shared/api/tauri";
 import type { RelayEvent, Workflow } from "@/shared/api/types";
+import { workflowIdentityKey } from "@/shared/api/workflowTypes";
 import { getWorkflowTriggerConfig } from "./workflowDefinition";
 import {
   type WorkflowTriggerPresentation,
@@ -17,7 +18,7 @@ export type WorkflowMessagePresentation = Pick<
 type WorkflowMessageLookup = {
   channelId: string;
   messageId: string;
-  workflowId: string;
+  workflowKey: string;
 };
 
 export function workflowMessageLookups(
@@ -27,7 +28,13 @@ export function workflowMessageLookups(
     const trigger = getWorkflowTriggerConfig(workflow.definition);
     const messageId = trigger ? workflowTriggerMessageId(trigger) : null;
     return workflow.channelId && messageId
-      ? [{ channelId: workflow.channelId, messageId, workflowId: workflow.id }]
+      ? [
+          {
+            channelId: workflow.channelId,
+            messageId,
+            workflowKey: workflowIdentityKey(workflow),
+          },
+        ]
       : [];
   });
 }
@@ -44,7 +51,7 @@ export async function loadWorkflowMessagePresentations(
     events.map((event) => [event.id.toLowerCase(), event]),
   );
   return new Map(
-    lookups.map(({ channelId, messageId, workflowId }) => {
+    lookups.map(({ channelId, messageId, workflowKey }) => {
       const message = validatedWorkflowMessageCandidate(
         eventById.get(messageId),
         {
@@ -53,7 +60,7 @@ export async function loadWorkflowMessagePresentations(
         },
       );
       return [
-        workflowId,
+        workflowKey,
         {
           messageId,
           messageLabel: message?.content?.trim() || null,
@@ -69,8 +76,8 @@ export function useWorkflowListMessagePresentations(
 ): Map<string, WorkflowMessagePresentation> {
   const lookups = workflowMessageLookups(workflows);
   const lookupKey = lookups
-    .map(({ channelId, messageId, workflowId }) =>
-      [workflowId, channelId, messageId].join(":"),
+    .map(({ channelId, messageId, workflowKey }) =>
+      [workflowKey, channelId, messageId].join(":"),
     )
     .sort()
     .join(",");
@@ -84,8 +91,8 @@ export function useWorkflowListMessagePresentations(
 
   if (!query.isPending) return query.data ?? new Map();
   return new Map(
-    lookups.map(({ messageId, workflowId }) => [
-      workflowId,
+    lookups.map(({ messageId, workflowKey }) => [
+      workflowKey,
       { messageId, messageLabel: null, messageLoading: true },
     ]),
   );

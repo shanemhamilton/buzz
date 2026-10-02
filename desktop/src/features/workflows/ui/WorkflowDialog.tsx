@@ -63,8 +63,8 @@ type WorkflowDialogProps = {
   initialChannelId?: string;
   mode: DialogMode;
   onDeleteWorkflow: (workflow: Workflow) => void;
-  onDuplicateWorkflow: (workflowId: string) => void;
-  onEditWorkflow: (workflowId: string) => void;
+  onDuplicateWorkflow: (workflow: Workflow) => void;
+  onEditWorkflow: (workflow: Workflow) => void;
   onEditorPaneChange: (pane: WorkflowEditorPane) => void;
   onOpenChange: (open: boolean) => void;
   onTriggerWorkflow: (workflowId: string) => void;
@@ -280,10 +280,7 @@ export function WorkflowDialog({
   const pendingEditorTransitionRef = React.useRef<(() => void) | null>(null);
 
   const createMutation = useCreateWorkflowMutation(selectedChannelId);
-  const updateMutation = useUpdateWorkflowMutation(
-    workflowSnapshot?.id ?? "",
-    workflowSnapshot?.revision ?? "",
-  );
+  const updateMutation = useUpdateWorkflowMutation(workflowSnapshot);
   const mutation = mode === "edit" ? updateMutation : createMutation;
 
   const selectedChannel =
@@ -628,7 +625,7 @@ export function WorkflowDialog({
                         <WorkflowDetailPanel
                           showDefinition={false}
                           showHeader={false}
-                          workflowId={workflowSnapshot.id}
+                          workflow={workflowSnapshot}
                         />
                       </div>
                     </PopoverContent>
@@ -641,12 +638,12 @@ export function WorkflowDialog({
                     onDelete={() => onDeleteWorkflow(workflowSnapshot)}
                     onDuplicate={() =>
                       requestEditorTransition(() =>
-                        onDuplicateWorkflow(workflowSnapshot.id),
+                        onDuplicateWorkflow(workflowSnapshot),
                       )
                     }
                     onEdit={() =>
                       requestEditorTransition(() =>
-                        onEditWorkflow(workflowSnapshot.id),
+                        onEditWorkflow(workflowSnapshot),
                       )
                     }
                     onToggleEnabled={handleToggleWorkflowEnabled}

@@ -50,21 +50,15 @@ pub(crate) fn retain_managed_agent_pending<R: tauri::Runtime>(
 /// `(30177, owner, agent_pubkey)` is purged first so an unpublished edit can
 /// never resurrect it after the tombstone publishes, then the kind:5 tombstone
 /// is retained at its own `(5, owner, agent_pubkey)` coordinate with
-/// `pending_sync = 1`. The `d_tag` is the agent's pubkey. Best-effort: a
-/// failure is logged and swallowed so a retention hiccup never blocks the
-/// disk-authoritative delete.
+/// `pending_sync = 1`. The `d_tag` is the agent's pubkey. Callers must secure
+/// this retry record before removing the managed-agent record or key.
 pub(crate) fn tombstone_managed_agent_pending(
     app: &AppHandle,
     state: &AppState,
     agent_pubkey: &str,
-) {
-    let result = (|| -> Result<(), String> {
-        let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
-        tombstone_managed_agent_at(&scope.db_path, &scope.owner_keys, agent_pubkey)
-    })();
-    if let Err(e) = result {
-        eprintln!("buzz-desktop: agent-tombstone: {e}");
-    }
+) -> Result<(), String> {
+    let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
+    tombstone_managed_agent_at(&scope.db_path, &scope.owner_keys, agent_pubkey)
 }
 
 /// Scope-free core of [`tombstone_managed_agent_pending`], so the atomic
@@ -118,6 +112,13 @@ pub(crate) fn tombstone_managed_agent_at(
     let result = (|| -> Result<(), String> {
         let prior_head =
             get_retained_event(&conn, KIND_MANAGED_AGENT, &owner_pubkey, agent_pubkey)?;
+        // A failed local-record save can retry this helper after the first
+        // transaction already purged the head. Keep the first archive request:
+        // it carries the persona id recovered from that head, which no longer
+        // exists on retry. Re-signing an empty replacement would discard the
+        // identity context needed by the archive processor.
+        let existing_archive =
+            get_retained_event(&conn, KIND_IA_ARCHIVE_REQUEST, &owner_pubkey, agent_pubkey)?;
         let event = build_agent_delete(agent_pubkey, &owner_pubkey)?
             .custom_created_at(monotonic_created_at(
                 prior_head.as_ref().map(|row| row.created_at),
@@ -129,7 +130,10 @@ pub(crate) fn tombstone_managed_agent_at(
         let persona_id = prior_head
             .as_ref()
             .and_then(|row| persona_id_from_head(&row.content));
-        let archive = build_agent_archive_request(keys, agent_pubkey, persona_id.as_deref())?;
+        let archive = existing_archive
+            .is_none()
+            .then(|| build_agent_archive_request(keys, agent_pubkey, persona_id.as_deref()))
+            .transpose()?;
         delete_retained_event(&conn, KIND_MANAGED_AGENT, &owner_pubkey, agent_pubkey)?;
         retain_event(
             &conn,
@@ -145,18 +149,21 @@ pub(crate) fn tombstone_managed_agent_at(
                 pending_sync: true,
             },
         )?;
-        retain_event(
-            &conn,
-            &RetainedEvent {
-                kind: KIND_IA_ARCHIVE_REQUEST,
-                pubkey: owner_pubkey.clone(),
-                d_tag: agent_pubkey.to_string(),
-                content: archive.content.to_string(),
-                created_at: archive.created_at.as_secs() as i64,
-                raw_event: archive.as_json(),
-                pending_sync: true,
-            },
-        )
+        if let Some(archive) = archive {
+            retain_event(
+                &conn,
+                &RetainedEvent {
+                    kind: KIND_IA_ARCHIVE_REQUEST,
+                    pubkey: owner_pubkey.clone(),
+                    d_tag: agent_pubkey.to_string(),
+                    content: archive.content.to_string(),
+                    created_at: archive.created_at.as_secs() as i64,
+                    raw_event: archive.as_json(),
+                    pending_sync: true,
+                },
+            )?;
+        }
+        Ok(())
     })();
     match result {
         Ok(()) => conn
@@ -380,6 +387,39 @@ mod tests {
         assert!(
             archive.content.contains("persona-abc"),
             "archive payload derives persona_id from the retained head; got: {}",
+            archive.content
+        );
+    }
+
+    #[test]
+    fn agent_tombstone_retry_preserves_archive_persona_id_after_head_purge() {
+        // The direct delete secures this transaction before deleting the local
+        // record. If a later local save fails, retry enters with no 30177 head;
+        // it must retain the first archive request rather than overwrite its
+        // persona_id with an empty retry payload.
+        use buzz_core_pkg::kind::KIND_IA_ARCHIVE_REQUEST;
+
+        let dir = tempfile::tempdir().unwrap();
+        let keys = nostr::Keys::generate();
+        let owner = keys.public_key().to_hex();
+        let db_path = dir.path().join("retention.sqlite3");
+
+        seed_agent_head_content(
+            &db_path,
+            &owner,
+            nostr::Timestamp::now().as_secs() as i64,
+            r#"{"name":"Agent","persona_id":"persona-abc"}"#,
+        );
+        tombstone_managed_agent_at(&db_path, &keys, AGENT_PUBKEY).unwrap();
+        tombstone_managed_agent_at(&db_path, &keys, AGENT_PUBKEY).unwrap();
+
+        let conn = open_retention_db(&db_path).unwrap();
+        let archive = get_retained_event(&conn, KIND_IA_ARCHIVE_REQUEST, &owner, AGENT_PUBKEY)
+            .unwrap()
+            .expect("retry keeps the original archive request");
+        assert!(
+            archive.content.contains("persona-abc"),
+            "retry must not replace retained archive identity context: {}",
             archive.content
         );
     }

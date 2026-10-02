@@ -634,6 +634,12 @@ struct QueuedNormalListenerEvent {
     reaction_target_id: String,
     event_for_steer: nostr::Event,
     prompt_tag_for_steer: String,
+    pending_nonretryable_notice: Option<PendingNonretryableNotice>,
+}
+
+struct PendingNonretryableNotice {
+    content: String,
+    edit: Option<queue::ResolvedEdit>,
 }
 
 impl QueuedNormalListenerEvent {
@@ -648,6 +654,29 @@ impl QueuedNormalListenerEvent {
         });
     }
 
+    /// Post the runtime's one deferred provider-failure notice against the
+    /// first accepted channel event after a heartbeat discovered the fault.
+    fn post_pending_nonretryable_notice(&mut self, rest_client: &relay::RestClient) {
+        let Some(PendingNonretryableNotice { content, edit }) =
+            self.pending_nonretryable_notice.take()
+        else {
+            return;
+        };
+        let batch = FlushBatch {
+            channel_id: self.scope.channel_id(),
+            scope: self.scope.clone(),
+            events: vec![queue::BatchEvent {
+                edit,
+                event: self.event_for_steer.clone(),
+                prompt_tag: self.prompt_tag_for_steer.clone(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        spawn_failure_notice(Some(rest_client), &batch, content);
+    }
+
     fn steer_or_interrupt(
         self,
         handling: MultipleEventHandling,
@@ -656,7 +685,10 @@ impl QueuedNormalListenerEvent {
         queue: &mut EventQueue,
         steer_ack_tx: &mpsc::UnboundedSender<SteerAckEvent>,
     ) {
-        if !self.accepted || !queue.is_scope_in_flight(&self.scope) {
+        if !self.accepted
+            || queue.is_nonretryable_dispatch_paused()
+            || !queue.is_scope_in_flight(&self.scope)
+        {
             return;
         }
         let Some(signal) = mode_gate_signal(handling, &self.effective_author, owner) else {
@@ -722,14 +754,30 @@ impl NormalListenerIngress {
         let event_for_steer = buzz_event.event.clone();
         let prompt_tag_for_steer = prompt_tag.clone();
         let channel_id = buzz_event.channel_id;
+        let received_at = std::time::Instant::now();
+        // Resolved edit routing is needed only if a heartbeat left a notice
+        // pending. Clone before the event enters the queue so the notice can
+        // retain the same routing context without removing the request.
+        let notice_edit = if queue.is_nonretryable_dispatch_paused() {
+            edit.clone()
+        } else {
+            None
+        };
         let accepted = queue.push(QueuedEvent {
             channel_id,
             scope: session_scope.clone(),
             event: buzz_event.event,
-            received_at: std::time::Instant::now(),
+            received_at,
             prompt_tag,
             edit,
         });
+        let pending_nonretryable_notice = accepted
+            .then(|| queue.take_nonretryable_notice())
+            .flatten()
+            .map(|content| PendingNonretryableNotice {
+                content,
+                edit: notice_edit,
+            });
         QueuedNormalListenerEvent {
             accepted,
             scope: session_scope,
@@ -737,6 +785,7 @@ impl NormalListenerIngress {
             reaction_target_id,
             event_for_steer,
             prompt_tag_for_steer,
+            pending_nonretryable_notice,
         }
     }
 }
@@ -1971,7 +2020,7 @@ const RESPAWN_MAX_DELAY: Duration = Duration::from_secs(30);
 /// instant, then allows one probe respawn (half-open). If the probe crashes, the
 /// circuit re-opens for another `CIRCUIT_BREAKER_COOLDOWN` period.
 ///
-/// All state transitions go through methods on this struct — callers never
+/// Crash state transitions go through methods on this struct — callers never
 /// manipulate `crash_times` or `open_until` directly.
 struct SlotCircuit {
     crash_times: Vec<std::time::Instant>,
@@ -1980,6 +2029,9 @@ struct SlotCircuit {
     /// Prevents duplicate spawns from maintenance ticks that fire before the
     /// previous spawn_and_init completes.
     respawn_in_flight: bool,
+    /// Live worker settings held across a planned recycle, including a failed
+    /// replacement attempt. Crash recovery intentionally leaves this empty.
+    recycled_settings: Option<RecycledAgentSettings>,
 }
 
 /// Result of [`SlotCircuit::record_crash`].
@@ -2055,19 +2107,22 @@ impl SlotCircuit {
     /// does NOT record a new crash — it only checks whether the circuit
     /// allows a respawn attempt.
     ///
-    /// Returns `true` if respawn is allowed. For half-open probes, pre-seeds
-    /// crash_times so the next crash re-opens immediately. For normal refills
-    /// (no circuit was ever opened), crash history is preserved so the breaker
-    /// can still trip if the refilled agent crashes quickly.
+    /// Returns `true` if respawn is allowed. Ordinary half-open probes pre-seed
+    /// `crash_times` so the next crash re-opens immediately. A planned worker
+    /// replacement that failed initialization keeps its saved settings and
+    /// prior crash history instead: its cooldown throttles retries without
+    /// charging a crash that did not happen.
     fn can_refill(&mut self) -> bool {
         let now = std::time::Instant::now();
         match self.open_until {
             Some(open_until) => {
                 if now >= open_until {
-                    // Half-open probe: pre-seed crash_times.
-                    self.crash_times.clear();
-                    for _ in 0..(CIRCUIT_BREAKER_THRESHOLD - 1) {
-                        self.crash_times.push(now);
+                    if self.recycled_settings.is_none() {
+                        // Ordinary half-open probe: pre-seed crash_times.
+                        self.crash_times.clear();
+                        for _ in 0..(CIRCUIT_BREAKER_THRESHOLD - 1) {
+                            self.crash_times.push(now);
+                        }
                     }
                     self.open_until = None;
                     true
@@ -2080,10 +2135,107 @@ impl SlotCircuit {
     }
 }
 
-/// True if any slot has a respawn task in flight. Used to prevent premature
-/// "all agents dead" exits — a respawning agent may succeed in seconds.
+/// True if any slot has a respawn task in flight.
 fn any_respawn_in_flight(crash_history: &[SlotCircuit]) -> bool {
     crash_history.iter().any(|s| s.respawn_in_flight)
+}
+
+/// True while at least one empty slot has a bounded path back to service.
+///
+/// A circuit-open slot is intentionally unavailable, not permanently dead:
+/// maintenance performs one half-open refill after its cooldown. Treating it
+/// as dead exits the outer harness before that recovery can run.
+fn has_scheduled_slot_recovery(crash_history: &[SlotCircuit]) -> bool {
+    any_respawn_in_flight(crash_history)
+        || crash_history.iter().any(|slot| slot.open_until.is_some())
+}
+
+/// Build the bounded tick that drives queue compaction and circuit recovery.
+///
+/// The first tick is one full interval out, so an otherwise quiet harness
+/// sleeps instead of immediately re-running maintenance after every event.
+fn maintenance_tick(interval: Duration) -> tokio::time::Interval {
+    let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tick
+}
+
+#[cfg(test)]
+mod circuit_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn cooldown_defers_refill_then_allows_one_half_open_probe() {
+        let mut slot = SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: Some(std::time::Instant::now() + Duration::from_secs(60)),
+            respawn_in_flight: false,
+            recycled_settings: None,
+        };
+
+        assert!(
+            !slot.can_refill(),
+            "an open circuit must not respawn before its cooldown"
+        );
+
+        slot.open_until = Some(std::time::Instant::now() - Duration::from_secs(1));
+        assert!(
+            slot.can_refill(),
+            "the cooldown must permit one half-open refill"
+        );
+        assert_eq!(slot.crash_times.len(), CIRCUIT_BREAKER_THRESHOLD - 1);
+        assert!(matches!(slot.record_crash(), CrashVerdict::CircuitOpen));
+        assert!(
+            slot.open_until.is_some(),
+            "a failed half-open probe must re-open the cooldown"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn maintenance_tick_wakes_quiet_half_open_refill_once_due() {
+        let mut slot = SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: Some(std::time::Instant::now() + Duration::from_secs(300)),
+            respawn_in_flight: false,
+            recycled_settings: None,
+        };
+        assert!(
+            !slot.can_refill(),
+            "a circuit-open slot must not retry before its cooldown"
+        );
+
+        let tick = maintenance_tick(Duration::from_secs(30));
+        let waiter = tokio::spawn(async move {
+            let mut tick = tick;
+            tick.tick().await;
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "maintenance must not run at startup");
+
+        tokio::time::advance(Duration::from_secs(29)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "quiet recovery must wait for the bounded maintenance interval"
+        );
+
+        // SlotCircuit intentionally uses std::time::Instant, which Tokio's
+        // paused clock does not advance. Expire it manually, then verify the
+        // production timer seam reaches exactly one eligible refill.
+        slot.open_until = Some(std::time::Instant::now() - Duration::from_secs(1));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        waiter.await.expect("maintenance tick task must complete");
+        let mut refill_attempts = 0;
+        if !slot.respawn_in_flight && slot.can_refill() {
+            slot.respawn_in_flight = true;
+            refill_attempts += 1;
+        }
+        if !slot.respawn_in_flight && slot.can_refill() {
+            refill_attempts += 1;
+        }
+        assert_eq!(refill_attempts, 1, "only one half-open refill may start");
+    }
 }
 
 /// Result of a background respawn task.
@@ -2091,6 +2243,31 @@ struct RespawnResult {
     index: usize,
     /// Tuple: (initialized client, protocol version, agent name).
     result: Result<(AcpClient, u32, String)>,
+}
+
+/// Runtime-only settings held by a worker after a live model selection.
+///
+/// A planned recycle deliberately replaces a healthy process, so it carries
+/// these values to the fresh worker just as a fresh session would. Session
+/// state itself is intentionally not retained across a process boundary.
+struct RecycledAgentSettings {
+    desired_model: Option<String>,
+    model_overridden: bool,
+    desired_model_request_id: Option<String>,
+    desired_model_pending_ack: bool,
+    startup_effort: Option<String>,
+}
+
+impl RecycledAgentSettings {
+    fn capture(agent: &OwnedAgent) -> Self {
+        Self {
+            desired_model: agent.desired_model.clone(),
+            model_overridden: agent.model_overridden,
+            desired_model_request_id: agent.desired_model_request_id.clone(),
+            desired_model_pending_ack: agent.desired_model_pending_ack,
+            startup_effort: agent.startup_effort.clone(),
+        }
+    }
 }
 
 /// Outcome of a non-cancelling steer attempt, forwarded from a per-attempt
@@ -2170,6 +2347,83 @@ impl Drop for RespawnGuard {
                 index: self.index,
                 result: Err(anyhow::anyhow!("respawn task panicked or was cancelled")),
             });
+        }
+    }
+}
+
+fn respawned_agent(
+    index: usize,
+    acp: AcpClient,
+    protocol_version: u32,
+    agent_name: String,
+    recycled_settings: Option<RecycledAgentSettings>,
+    config: &Config,
+) -> OwnedAgent {
+    let settings = recycled_settings.unwrap_or_else(|| RecycledAgentSettings {
+        desired_model: config.model.clone(),
+        model_overridden: false,
+        desired_model_request_id: None,
+        desired_model_pending_ack: false,
+        startup_effort: config.effort_level.clone(),
+    });
+    OwnedAgent {
+        index,
+        acp,
+        state: SessionState::default(),
+        model_capabilities: None,
+        desired_model: settings.desired_model,
+        model_overridden: settings.model_overridden,
+        desired_model_request_id: settings.desired_model_request_id,
+        desired_model_pending_ack: settings.desired_model_pending_ack,
+        startup_effort: settings.startup_effort,
+        agent_name,
+        goose_system_prompt_supported: None,
+        protocol_version,
+    }
+}
+
+/// Rejoin a completed replacement with its slot.
+///
+/// Planned recycle settings stay on the slot until initialization succeeds, so
+/// a failed replacement can wait for maintenance without losing a live model
+/// selection or deferred acknowledgement.
+fn complete_respawn_result(
+    pool: &mut AgentPool,
+    crash_history: &mut [SlotCircuit],
+    rr: RespawnResult,
+    config: &Config,
+) -> bool {
+    crash_history[rr.index].respawn_in_flight = false;
+    match rr.result {
+        Ok((acp, protocol_version, agent_name)) => {
+            let recycled_settings = crash_history[rr.index].recycled_settings.take();
+            let agent = respawned_agent(
+                rr.index,
+                acp,
+                protocol_version,
+                agent_name,
+                recycled_settings,
+                config,
+            );
+            pool.return_agent(agent);
+            tracing::info!(agent = rr.index, "respawn complete");
+            true
+        }
+        Err(error) => {
+            if crash_history[rr.index].recycled_settings.is_some() {
+                crash_history[rr.index].mark_spawn_failed();
+                tracing::warn!(
+                    agent = rr.index,
+                    "planned worker recycle failed: {error} — maintenance will retry after cooldown"
+                );
+            } else {
+                crash_history[rr.index].mark_spawn_failed();
+                tracing::warn!(
+                    agent = rr.index,
+                    "respawn failed: {error} — circuit re-opened"
+                );
+            }
+            false
         }
     }
 }
@@ -2364,6 +2618,7 @@ mod idle_pool_sleep_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight,
+            recycled_settings: None,
         }
     }
 
@@ -2951,11 +3206,14 @@ async fn run_harness(
         ))
     };
 
-    // Runs at the TOP of every loop iteration via Instant check — cannot be
-    // starved by the biased select. Slot refill spawns background tasks so
-    // spawn_and_init never blocks the main loop.
+    // Runs at the top of every loop iteration. A dedicated tick wakes quiet
+    // harnesses, so a circuit-open slot reaches its half-open refill even when
+    // presence, typing, heartbeats, inactivity, and relay traffic are idle.
+    // Slot refill spawns background tasks so spawn_and_init never blocks the
+    // main loop.
     let maintenance_interval = Duration::from_secs(30);
-    let mut last_maintenance = std::time::Instant::now();
+    let mut last_maintenance = tokio::time::Instant::now();
+    let mut maintenance_recovery_tick = maintenance_tick(maintenance_interval);
 
     // Channel for background respawn tasks to return completed agents.
     // Bounded to agent count — at most one respawn per slot in flight.
@@ -3022,6 +3280,7 @@ async fn run_harness(
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            recycled_settings: None,
         })
         .collect();
 
@@ -3075,7 +3334,7 @@ async fn run_harness(
         }
 
         if pool_ready && last_maintenance.elapsed() >= maintenance_interval {
-            last_maintenance = std::time::Instant::now();
+            last_maintenance = tokio::time::Instant::now();
             queue.compact_expired_state();
 
             // Slot refill: spawn background tasks for empty slots whose
@@ -3122,32 +3381,7 @@ async fn run_harness(
 
         let mut respawn_collected = false;
         while let Ok(rr) = respawn_rx.try_recv() {
-            crash_history[rr.index].respawn_in_flight = false;
-            match rr.result {
-                Ok((acp, protocol_version, agent_name)) => {
-                    let agent = OwnedAgent {
-                        index: rr.index,
-                        acp,
-                        state: SessionState::default(),
-                        model_capabilities: None,
-                        desired_model: config.model.clone(),
-                        model_overridden: false,
-                        desired_model_request_id: None,
-                        desired_model_pending_ack: false,
-                        startup_effort: config.effort_level.clone(),
-                        agent_name,
-                        goose_system_prompt_supported: None,
-                        protocol_version,
-                    };
-                    pool.return_agent(agent);
-                    tracing::info!(agent = rr.index, "respawn complete");
-                    respawn_collected = true;
-                }
-                Err(e) => {
-                    crash_history[rr.index].mark_spawn_failed();
-                    tracing::warn!(agent = rr.index, "respawn failed: {e} — circuit re-opened");
-                }
-            }
+            respawn_collected |= complete_respawn_result(&mut pool, &mut crash_history, rr, config);
         }
         // Reap completed respawn handles from the JoinSet. Payloads are
         // delivered out-of-band through `respawn_rx` (drained above), so the
@@ -3220,6 +3454,10 @@ async fn run_harness(
                         _ => std::future::pending().await,
                     }
                 } => None,
+                _ = maintenance_recovery_tick.tick(), if pool_ready => {
+                    let _ = result_rx;
+                    None
+                },
                 _ = pool::AgentPool::wait_for_hold_deadline(hold_deadline), if pool_ready => {
                     Some(PoolEvent::HoldDeadline)
                 },
@@ -3592,13 +3830,14 @@ async fn run_harness(
                                 policy = %config.session_policy,
                                 "admitted event — resolved session scope"
                             );
-                            let queued = ingress.push(&mut queue, session_scope);
+                            let mut queued = ingress.push(&mut queue, session_scope);
                             // 👀 — immediate "seen" reaction, only if the event
                             // was actually queued (not dropped by DedupMode::Drop).
                             // Fire-and-forget: on rare fast-failure paths the
                             // guard's cleanup may race with this add, leaving a
                             // cosmetic stale 👀. Acceptable — see ReactionGuard docs.
                             queued.mark_seen(&ctx.rest_client);
+                            queued.post_pending_nonretryable_notice(&ctx.rest_client);
                             // Event is already queued. The authorized ingress
                             // retains its verified author, resolved scope, and
                             // event data through the optional steer/interrupt
@@ -3716,10 +3955,17 @@ async fn run_harness(
                         {
                             typing_channels.insert(scope, thread_tags);
                         }
-                    } else if pool.any_idle() {
+                    } else if heartbeat_dispatch_allowed(
+                        &queue,
+                        heartbeat_in_flight,
+                        pool.any_idle(),
+                    ) {
                         dispatch_heartbeat(&mut pool, &ctx, &mut heartbeat_in_flight);
                     } else {
-                        tracing::debug!("heartbeat_skipped_busy");
+                        tracing::debug!(
+                            paused = queue.is_nonretryable_dispatch_paused(),
+                            "heartbeat_skipped"
+                        );
                     }
                     None
                 }
@@ -3838,7 +4084,7 @@ async fn run_harness(
                     &mut respawn_tasks,
                     observer.clone(),
                 );
-                if pool.live_count() == 0 && !any_respawn_in_flight(&crash_history) {
+                if pool.live_count() == 0 && !has_scheduled_slot_recovery(&crash_history) {
                     tracing::error!("all agents dead — exiting");
                     break;
                 }
@@ -4919,6 +5165,20 @@ fn dispatch_pending(
         queue.requeue_preserve_timestamps(batch);
         queue.mark_complete(scope);
     }
+    // Surface dead-lettered cancelled batches as user-visible failure notices.
+    // They are parked by `flush_next` (never returned as flushable batches, so
+    // they cannot be re-prompted); the notice is what `handle_prompt_result`
+    // would have posted for a normal dead-letter via `requeue()`.
+    for batch in queue.take_dead_letters() {
+        spawn_failure_notice(
+            Some(&ctx.rest_client),
+            &batch,
+            "⚠️ I couldn't process the last request after multiple cancel+merge \
+             redispatches (the turn kept getting interrupted). Please re-send \
+             if it's still needed."
+                .to_string(),
+        );
+    }
     tracing::debug!(
         dispatched = dispatched_channels.len(),
         queue_depth = queue.pending_channels(),
@@ -4927,33 +5187,124 @@ fn dispatch_pending(
     dispatched_channels
 }
 
-/// Returns `true` when `error` is a non-retryable authentication failure.
+/// A provider failure that cannot be repaired by retrying the same prompt.
 ///
-/// Retrying auth errors is harmful: the token won't self-repair between
-/// attempts, so each retry wastes an attempt slot, delays the visible failure,
-/// and burns the user's context window. Dead-letter immediately and surface a
-/// re-authentication hint instead.
+/// These variants deliberately carry no provider text. The messages received
+/// from an ACP adapter can contain endpoint URLs, account details, or tokens;
+/// runtime lifecycle and activity events must expose only the safe, actionable
+/// classification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NonRetryablePromptFailure {
+    Authentication,
+    ConfiguredModelUnavailable,
+    UnsupportedProviderModel,
+    MonthlySpendLimit,
+}
+
+impl NonRetryablePromptFailure {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Authentication => "authentication",
+            Self::ConfiguredModelUnavailable => "configured_model_unavailable",
+            Self::UnsupportedProviderModel => "unsupported_provider_model",
+            Self::MonthlySpendLimit => "monthly_spend_limit",
+        }
+    }
+
+    fn notice(self) -> &'static str {
+        match self {
+            Self::Authentication => {
+                "⚠️ I couldn't process the last request: authentication failed. \
+                Please re-authenticate the CLI (e.g. run `claude /login` or `codex login`) \
+                restart the agent, then re-send your request."
+            }
+            Self::ConfiguredModelUnavailable => {
+                "⚠️ I couldn't process the last request: the configured model wasn't found at \
+                the provider's endpoint. Open agent settings, select a different model from the \
+                dropdown, and save your changes. Restart the agent to apply the new configuration, \
+                then re-send your request."
+            }
+            Self::UnsupportedProviderModel => {
+                "⚠️ I couldn't process the last request: the selected model isn't supported by \
+                this ACP provider. Open agent settings, select a supported model, and save your \
+                changes. Restart the agent to apply the new configuration, then re-send your request."
+            }
+            Self::MonthlySpendLimit => {
+                "⚠️ I couldn't process the last request: the provider's monthly spending limit \
+                has been reached. Resolve the provider account limit, restart the agent, then \
+                re-send your request."
+            }
+        }
+    }
+
+    fn runtime_error(self) -> &'static str {
+        match self {
+            Self::Authentication => {
+                "Provider authentication failed. Re-authenticate the CLI, then restart this agent."
+            }
+            Self::ConfiguredModelUnavailable => {
+                "Configured model is unavailable. Select another model, then restart this agent."
+            }
+            Self::UnsupportedProviderModel => {
+                "Selected model is not supported by this ACP provider. Select another model, then restart this agent."
+            }
+            Self::MonthlySpendLimit => {
+                "Provider monthly spending limit reached. Resolve the account limit, then restart this agent."
+            }
+        }
+    }
+}
+
+/// Classify only provider failures that cannot self-repair between retries.
 ///
-/// # Classification rationale
-///
-/// Auth failures arrive as [`acp::AcpError::AgentError`] with a message
-/// surfaced from the upstream CLI. Two narrow patterns reliably identify
-/// non-transient auth failures observed in the field:
-///
-/// - `"Re-authenticate"` — emitted by the Claude CLI when an OAuth token has
-///   expired ("OAuth access token has expired. Re-authenticate to continue.").
-///   Specific to the auth-expiry flow; does not appear in unrelated errors.
-/// - `"API Error: 401"` — present in Claude/Codex HTTP-401 responses; 401 is
-///   the standard auth-failure status and does not arise from network blips.
-///
-/// False positives (misclassifying a transient error as non-retryable) silently
-/// drop a user message, which is worse than a false negative (extra retries on
-/// an auth error). Both patterns are therefore chosen for high precision.
-fn is_auth_error(error: &acp::AcpError) -> bool {
-    let acp::AcpError::AgentError { message, .. } = error else {
-        return false;
+/// This intentionally uses narrow, observed phrases. A false positive would
+/// park a request that a bounded retry could have recovered, whereas an
+/// unrecognized provider error remains on the existing bounded retry path.
+fn classify_non_retryable_error(error: &acp::AcpError) -> Option<NonRetryablePromptFailure> {
+    let acp::AcpError::AgentError { code, message } = error else {
+        return None;
     };
-    message.contains("Re-authenticate") || message.contains("API Error: 401")
+    let message = message.to_ascii_lowercase();
+    // ACP adapters sometimes wrap a JSON provider error as a JSON string.
+    // Normalize that quoting so the observed Codex `status: 400` payload is
+    // classified the same way whether it is emitted directly or through an
+    // adapter envelope.
+    let message = message.replace("\\\"", "\"");
+    let is_http_400 = message.contains("http 400")
+        || message.contains(r#""status":400"#)
+        || message.contains(r#""status": 400"#);
+
+    if *code == -32002 && message.contains("model not found") {
+        Some(NonRetryablePromptFailure::ConfiguredModelUnavailable)
+    } else if is_http_400
+        && (message.contains("unsupported") || message.contains("not supported"))
+        && message.contains("model")
+    {
+        Some(NonRetryablePromptFailure::UnsupportedProviderModel)
+    } else if message.contains("monthly spend limit") || message.contains("monthly-spend-limit") {
+        Some(NonRetryablePromptFailure::MonthlySpendLimit)
+    } else if message.contains("re-authenticate") || message.contains("api error: 401") {
+        Some(NonRetryablePromptFailure::Authentication)
+    } else {
+        None
+    }
+}
+
+fn emit_nonretryable_runtime_failure(
+    observer: Option<&observer::ObserverHandle>,
+    config: &Config,
+    failure: NonRetryablePromptFailure,
+) {
+    let start_nonce = std::env::var("BUZZ_MANAGED_AGENT_START_NONCE").unwrap_or_default();
+    let pubkey = config.keys.public_key().to_hex();
+    emit_runtime_lifecycle(
+        observer,
+        &start_nonce,
+        &pubkey,
+        &config.relay_url,
+        "failed",
+        Some(failure.runtime_error()),
+    );
 }
 
 /// Thread placement for a batch's terminal failure notice.
@@ -5026,6 +5377,12 @@ fn handle_prompt_result(
     observer: Option<observer::ObserverHandle>,
     rest_client: Option<&relay::RestClient>,
 ) -> LoopAction {
+    let nonretryable_failure = match &result.outcome {
+        PromptOutcome::Error(error) => classify_non_retryable_error(error),
+        _ => None,
+    };
+    let newly_paused_nonretryable_failure = nonretryable_failure
+        .is_some_and(|failure| queue.pause_nonretryable_dispatch(failure.notice().to_string()));
     let before = pool.task_map().len();
     let agent_index = result.agent.index;
     let successful_steer_deliveries = pool
@@ -5131,38 +5488,22 @@ fn handle_prompt_result(
                 } else {
                     hard_timeout_fate_suffix = Some(" — requeued for retry (recently active)");
                 }
-            } else if matches!(
-                &result.outcome,
-                PromptOutcome::Error(acp::AcpError::AgentError { code: -32002, message })
-                    if message.contains("model not found")
-            ) {
-                // Retrying the same missing model cannot repair its configuration.
+            } else if let Some(failure) = nonretryable_failure {
+                // Re-running the unchanged provider configuration cannot
+                // resolve this failure. Keep the complete batch in memory and
+                // pause all automatic dispatch: configuration and account
+                // state are shared across scopes, so a fresh scope would only
+                // amplify the provider failure.
                 tracing::warn!(
                     channel_id = %batch.channel_id,
                     events = batch.events.len(),
-                    "dead-lettering batch immediately — model not found"
+                    failure = failure.label(),
+                    "quarantining batch after non-retryable provider failure"
                 );
-                let content = "⚠️ I couldn't process the last request: the configured model \
-                    wasn't found at the provider's endpoint. Open agent settings, select a \
-                    different model from the dropdown, and save your changes. Restart the agent \
-                    to apply the new configuration, then re-send your request."
-                    .to_string();
-                spawn_failure_notice(rest_client, &batch, content);
-            } else if matches!(&result.outcome, PromptOutcome::Error(e) if is_auth_error(e)) {
-                // Auth errors are non-retryable: the token won't self-repair
-                // between retries, so requeueing only wastes attempt slots and
-                // delays the visible failure. Dead-letter immediately and tell
-                // the user to re-authenticate the CLI.
-                tracing::warn!(
-                    channel_id = %batch.channel_id,
-                    events = batch.events.len(),
-                    "dead-lettering batch immediately — non-retryable auth error"
-                );
-                let content = "⚠️ I couldn't process the last request: authentication failed. \
-                    Please re-authenticate the CLI (e.g. run `claude /login` or `codex login`) \
-                    and then re-send."
-                    .to_string();
-                spawn_failure_notice(rest_client, &batch, content);
+                queue.quarantine_nonretryable(batch.clone());
+                if let Some(content) = queue.take_nonretryable_notice() {
+                    spawn_failure_notice(rest_client, &batch, content);
+                }
             } else if let Some(dead) = queue.requeue(batch) {
                 let reason = match &result.outcome {
                     PromptOutcome::Timeout(TimeoutKind::Idle) => "the turn timed out".to_string(),
@@ -5189,9 +5530,26 @@ fn handle_prompt_result(
         }
     }
 
+    // This clears only the in-flight dispatch lease. A non-retryable batch is
+    // already retained in `EventQueue::quarantined_batches`; it is not treated
+    // as a completed request.
     match &result.source {
         PromptSource::Channel(scope) => queue.mark_complete(scope.clone()),
         PromptSource::Heartbeat => *heartbeat_in_flight = false,
+    }
+
+    // A heartbeat has no channel reply context. If accepted work was already
+    // waiting when it found the definitive provider fault, use that preserved
+    // context for the runtime's sole recovery notice instead of waiting for a
+    // later ingress that may never arrive. Removed channels cannot consume it.
+    if let Some((batch, content)) =
+        queue.take_nonretryable_notice_for_pending_batch(removed_channels)
+    {
+        spawn_failure_notice(rest_client, &batch, content);
+    }
+
+    if let Some(failure) = nonretryable_failure.filter(|_| newly_paused_nonretryable_failure) {
+        emit_nonretryable_runtime_failure(observer.as_ref(), config, failure);
     }
 
     // Strip sessions for channels the agent was removed from while this
@@ -5254,7 +5612,15 @@ fn handle_prompt_result(
                 outcome = outcome_label,
                 "agent_returned"
             );
-            pool.return_agent(result.agent);
+            return_or_recycle_agent(
+                pool,
+                result.agent,
+                config,
+                crash_history,
+                respawn_tx,
+                respawn_tasks,
+                observer.clone(),
+            );
         }
         // Fatal outcomes: the agent subprocess is dead or poisoned — respawn it.
         PromptOutcome::AgentExited | PromptOutcome::Timeout(_) => {
@@ -5283,20 +5649,14 @@ fn handle_prompt_result(
 
             let index = result.agent.index;
             let slot_history = &mut crash_history[index];
-            if !spawn_respawn_task(
+            spawn_respawn_task(
                 result.agent,
                 config,
                 slot_history,
                 respawn_tx,
                 respawn_tasks,
                 observer.clone(),
-            ) {
-                // Circuit open — slot stays empty until maintenance refill.
-                if pool.live_count() == 0 && !any_respawn_in_flight(crash_history) {
-                    tracing::error!("all agents dead — exiting");
-                    return LoopAction::Exit;
-                }
-            }
+            );
         }
         // Cancel-drain expiry: a control-signal cancel (steer fallback,
         // interrupt, or explicit stop) did not drain within its bounded
@@ -5323,20 +5683,14 @@ fn handle_prompt_result(
 
             let index = result.agent.index;
             let slot_history = &mut crash_history[index];
-            if !spawn_respawn_task(
+            spawn_respawn_task(
                 result.agent,
                 config,
                 slot_history,
                 respawn_tx,
                 respawn_tasks,
                 observer.clone(),
-            ) {
-                // Circuit open — slot stays empty until maintenance refill.
-                if pool.live_count() == 0 && !any_respawn_in_flight(crash_history) {
-                    tracing::error!("all agents dead — exiting");
-                    return LoopAction::Exit;
-                }
-            }
+            );
         }
         // Errors fall into two categories:
         //
@@ -5361,7 +5715,15 @@ fn handle_prompt_result(
                 pid = harness_pid,
                 "agent_returned (cancelled)"
             );
-            pool.return_agent(result.agent);
+            return_or_recycle_agent(
+                pool,
+                result.agent,
+                config,
+                crash_history,
+                respawn_tx,
+                respawn_tasks,
+                observer.clone(),
+            );
         }
         PromptOutcome::ProjectContextIndeterminate(reason) => {
             tracing::warn!(
@@ -5371,7 +5733,15 @@ fn handle_prompt_result(
                 "agent_returned (local project context indeterminate — pipe intact)"
             );
             emit_turn_error(&reason, None);
-            pool.return_agent(result.agent);
+            return_or_recycle_agent(
+                pool,
+                result.agent,
+                config,
+                crash_history,
+                respawn_tx,
+                respawn_tasks,
+                observer.clone(),
+            );
         }
         PromptOutcome::Error(ref e) => {
             let is_transport_error = matches!(
@@ -5398,30 +5768,45 @@ fn handle_prompt_result(
 
                 let index = result.agent.index;
                 let slot_history = &mut crash_history[index];
-                if !spawn_respawn_task(
+                spawn_respawn_task(
                     result.agent,
                     config,
                     slot_history,
                     respawn_tx,
                     respawn_tasks,
                     observer,
-                ) && pool.live_count() == 0
-                    && !any_respawn_in_flight(crash_history)
-                {
-                    tracing::error!("all agents dead — exiting");
-                    return LoopAction::Exit;
-                }
-            } else {
-                tracing::warn!(
-                    agent = agent_index,
-                    outcome = outcome_label,
-                    configured_model = %harness_configured_model,
-                    pid = harness_pid,
-                    error = %e,
-                    "agent_returned (application error — pipe intact)"
                 );
-                emit_turn_error(&e.to_string(), error_code);
-                pool.return_agent(result.agent);
+            } else {
+                if let Some(failure) = nonretryable_failure {
+                    tracing::warn!(
+                        agent = agent_index,
+                        outcome = outcome_label,
+                        configured_model = %harness_configured_model,
+                        pid = harness_pid,
+                        failure = failure.label(),
+                        "agent_returned (non-retryable provider error — pipe intact)"
+                    );
+                    emit_turn_error(failure.runtime_error(), error_code);
+                } else {
+                    tracing::warn!(
+                        agent = agent_index,
+                        outcome = outcome_label,
+                        configured_model = %harness_configured_model,
+                        pid = harness_pid,
+                        error = %e,
+                        "agent_returned (application error — pipe intact)"
+                    );
+                    emit_turn_error(&e.to_string(), error_code);
+                }
+                return_or_recycle_agent(
+                    pool,
+                    result.agent,
+                    config,
+                    crash_history,
+                    respawn_tx,
+                    respawn_tasks,
+                    observer.clone(),
+                );
             }
         }
     }
@@ -5571,12 +5956,20 @@ fn drain_ready_join_results(
                 respawn_tasks,
                 observer.clone(),
             );
-            if pool.live_count() == 0 && !any_respawn_in_flight(crash_history) {
+            if pool.live_count() == 0 && !has_scheduled_slot_recovery(crash_history) {
                 return LoopAction::Exit;
             }
         }
     }
     LoopAction::Continue
+}
+
+fn heartbeat_dispatch_allowed(
+    queue: &EventQueue,
+    heartbeat_in_flight: bool,
+    pool_has_idle_agent: bool,
+) -> bool {
+    !queue.is_nonretryable_dispatch_paused() && !heartbeat_in_flight && pool_has_idle_agent
 }
 
 fn dispatch_heartbeat(
@@ -5789,6 +6182,52 @@ fn spawn_respawn_task(
     });
 
     true
+}
+
+/// Replace a healthy worker after it reaches an adapter-specific session bound.
+///
+/// This only runs at a completed prompt boundary and does not call
+/// `SlotCircuit::record_crash`, so a planned recycle neither spends crash
+/// budget nor waits through crash backoff. Its result carries live model and
+/// effort state because the replacement is part of one logical worker lifetime.
+fn return_or_recycle_agent(
+    pool: &mut AgentPool,
+    agent: OwnedAgent,
+    config: &Config,
+    crash_history: &mut [SlotCircuit],
+    respawn_tx: &mpsc::Sender<RespawnResult>,
+    respawn_tasks: &mut tokio::task::JoinSet<()>,
+    observer: Option<observer::ObserverHandle>,
+) {
+    if !agent.acp.should_recycle_after_completed_prompt() {
+        pool.return_agent(agent);
+        return;
+    }
+
+    let index = agent.index;
+    debug_assert!(
+        !crash_history[index].respawn_in_flight,
+        "a completed worker cannot have another replacement in flight"
+    );
+    crash_history[index].respawn_in_flight = true;
+    crash_history[index].recycled_settings = Some(RecycledAgentSettings::capture(&agent));
+    let cmd = config.agent_command.clone();
+    let args = config.agent_args.clone();
+    let env = config.persona_env_vars.clone();
+    let has_codex = config.has_generated_codex_config;
+    let guard = RespawnGuard::new(index, respawn_tx.clone());
+    tracing::info!(
+        agent = index,
+        "recycling worker after session creation limit"
+    );
+    respawn_tasks.spawn(async move {
+        let mut agent = agent;
+        agent.acp.shutdown().await;
+        drop(agent);
+
+        let result = spawn_and_init(&cmd, &args, &env, has_codex, index, observer).await;
+        guard.send(result);
+    });
 }
 
 fn normalized_agent_name(init_result: &serde_json::Value) -> String {
@@ -9898,14 +10337,11 @@ mod build_mcp_servers_tests {
 
 #[cfg(test)]
 mod error_outcome_emission_tests {
-    //! Pins the policy that error-class outcomes surface to the activity feed
-    //! and never to the channel:
+    //! Pins error-outcome reporting and bounded channel recovery notices:
     //!
-    //! - Channel silence is enforced *structurally* — `handle_prompt_result`
-    //!   takes no relay handle, so it has no way to post a channel message. A
-    //!   future re-introduction of channel notices would have to add the relay
-    //!   parameter back, which these tests' construction would then refuse to
-    //!   compile against.
+    //! - Only definitive provider faults emit one sanitized recovery notice,
+    //!   either from the failed channel batch or from a preserved accepted
+    //!   channel context after a heartbeat fault.
     //! - Feed coverage is the regression-prone half and is asserted at runtime:
     //!   each error outcome must emit exactly one `turn_error` observer event.
     //!   If any branch drops its `emit_turn_error` call, the matching test goes
@@ -10071,6 +10507,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            recycled_settings: None,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -10151,6 +10588,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            recycled_settings: None,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -10272,6 +10710,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            recycled_settings: None,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -10337,6 +10776,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            recycled_settings: None,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -10421,6 +10861,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            recycled_settings: None,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -10515,6 +10956,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: Some(std::time::Instant::now() + Duration::from_secs(3600)),
             respawn_in_flight: false,
+            recycled_settings: None,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -10608,6 +11050,7 @@ mod error_outcome_emission_tests {
                 crash_times: Vec::new(),
                 open_until: None,
                 respawn_in_flight: false,
+                recycled_settings: None,
             }];
             let (respawn_tx, _respawn_rx) = mpsc::channel(8);
             let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -10706,6 +11149,7 @@ mod error_outcome_emission_tests {
                 crash_times: Vec::new(),
                 open_until: None,
                 respawn_in_flight: false,
+                recycled_settings: None,
             }];
             let (respawn_tx, _respawn_rx) = mpsc::channel(8);
             let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -10815,6 +11259,7 @@ mod error_outcome_emission_tests {
                 crash_times: Vec::new(),
                 open_until: None,
                 respawn_in_flight: false,
+                recycled_settings: None,
             }];
             let (respawn_tx, _respawn_rx) = mpsc::channel(8);
             let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -10893,6 +11338,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            recycled_settings: None,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -10990,6 +11436,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            recycled_settings: None,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -11125,6 +11572,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            recycled_settings: None,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -11224,6 +11672,109 @@ mod error_outcome_emission_tests {
         );
     }
 
+    /// A circuit-open slot has a scheduled half-open recovery. A
+    /// cancel-drain timeout must preserve its accepted batch and leave the
+    /// outer harness alive for maintenance, rather than converting the
+    /// temporary cooldown into a clean process exit.
+    #[tokio::test]
+    async fn cancel_drain_timeout_with_open_circuit_waits_for_maintenance() {
+        let event = EventBuilder::new(Kind::Custom(9), "original")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let channel_id = Uuid::new_v4();
+        let batch = FlushBatch {
+            channel_id,
+            scope: scope::SessionScope::Conversation { channel_id },
+            events: vec![BatchEvent {
+                edit: None,
+                event: event.clone(),
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: Some(CancelReason::Steer),
+        };
+
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: None,
+                scope: None,
+                turn_id: "test-turn-id".to_string(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: Some(std::time::Instant::now() + Duration::from_secs(300)),
+            respawn_in_flight: false,
+            recycled_settings: None,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
+            turn_id: "test-turn-id".to_string(),
+            outcome: PromptOutcome::CancelDrainTimeout(Duration::from_secs(5)),
+            batch: Some(batch),
+        };
+
+        assert!(matches!(
+            handle_prompt_result(
+                &mut pool,
+                &mut queue,
+                &config,
+                result,
+                &mut heartbeat_in_flight,
+                &removed_channels,
+                &mut crash_history,
+                &respawn_tx,
+                &mut respawn_tasks,
+                None,
+                None,
+            ),
+            LoopAction::Continue
+        ));
+
+        assert_eq!(pool.live_count(), 0, "poisoned agent must not return idle");
+        assert!(
+            respawn_tasks.is_empty(),
+            "the open circuit must defer respawn until maintenance"
+        );
+        assert!(
+            has_scheduled_slot_recovery(&crash_history),
+            "the outer harness must recognize the pending half-open recovery"
+        );
+
+        let requeued = queue.flush_next().expect("accepted batch must be retained");
+        assert_eq!(
+            requeued.events.len(),
+            1,
+            "a lone cancelled batch must be redelivered as the next regular batch"
+        );
+        assert_eq!(
+            requeued.events[0].event.id, event.id,
+            "the retained batch must contain the original accepted event"
+        );
+        assert!(
+            requeued.cancelled_events.is_empty(),
+            "without a newer queued event there is nothing to merge with the cancelled batch"
+        );
+        assert_eq!(requeued.cancel_reason, Some(CancelReason::Steer));
+    }
+
     /// Explicit Stop (`ControlSignal::Cancel`) on cancel-drain expiry drops
     /// the triggering batch — `requeue_cancelled_batch` returns `None` for
     /// `Cancel`/`Rotate`. The observer payload must be the SAME fate-neutral
@@ -11256,6 +11807,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            recycled_settings: None,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -11391,6 +11943,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            recycled_settings: None,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -11439,66 +11992,74 @@ mod error_outcome_emission_tests {
         assert!(respawn_tasks.is_empty());
     }
 
-    // ── is_auth_error classification ───────────────────────────────────────
+    // ── non-retryable provider-failure classification ─────────────────────
 
     #[test]
-    fn is_auth_error_matches_reauthenticate_message() {
-        let e = acp::AcpError::AgentError {
-            code: -32000,
-            message: "API Error: OAuth access token has expired. Re-authenticate to continue."
-                .to_string(),
-        };
-        assert!(
-            is_auth_error(&e),
-            "Re-authenticate variant must be classified as auth error"
-        );
-    }
+    fn classifies_only_observed_nonretryable_provider_failures() {
+        let cases = [
+            (
+                -32000,
+                "API Error: OAuth access token has expired. Re-authenticate to continue.",
+                Some(NonRetryablePromptFailure::Authentication),
+            ),
+            (
+                -32000,
+                "Internal error: API Error: 401 OAuth access token has expired.",
+                Some(NonRetryablePromptFailure::Authentication),
+            ),
+            (
+                -32002,
+                "llm model not found: configured model is absent",
+                Some(NonRetryablePromptFailure::ConfiguredModelUnavailable),
+            ),
+            (
+                -32000,
+                r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."}}"#,
+                Some(NonRetryablePromptFailure::UnsupportedProviderModel),
+            ),
+            (
+                -32000,
+                "Internal error: You've hit your monthly spend limit · raise it at claude.ai/settings/usage?from=cc_cli_limit_message · your weekly limit resets 8pm (America/Chicago)",
+                Some(NonRetryablePromptFailure::MonthlySpendLimit),
+            ),
+            (
+                -32601,
+                "Usage credits required for 1M context — turn on usage credits",
+                None,
+            ),
+            (-32000, "ACP request failed: HTTP 400 bad request", None),
+            (-32000, "ACP request failed: HTTP 429 rate limit", None),
+            (-32002, "Resource not found: session no longer exists", None),
+        ];
 
-    #[test]
-    fn is_auth_error_matches_401_message() {
-        let e = acp::AcpError::AgentError {
-            code: -32000,
-            message: "Internal error: API Error: 401 OAuth access token has expired.".to_string(),
-        };
-        assert!(
-            is_auth_error(&e),
-            "API Error: 401 variant must be classified as auth error"
-        );
-    }
+        for (code, message, expected) in cases {
+            let error = acp::AcpError::AgentError {
+                code,
+                message: message.to_string(),
+            };
+            assert_eq!(classify_non_retryable_error(&error), expected, "{message}");
+        }
 
-    #[test]
-    fn is_auth_error_rejects_other_agent_error_message() {
-        let e = acp::AcpError::AgentError {
-            code: -32601,
-            message: "Usage credits required for 1M context — turn on usage credits".to_string(),
-        };
-        assert!(
-            !is_auth_error(&e),
-            "usage-credit error must NOT be classified as auth error"
-        );
-    }
-
-    #[test]
-    fn is_auth_error_rejects_transport_errors() {
         let io = acp::AcpError::Io(std::io::Error::other("pipe broke"));
-        assert!(
-            !is_auth_error(&io),
-            "I/O error must not be classified as auth error"
-        );
-        let timeout = acp::AcpError::WriteTimeout(std::time::Duration::from_secs(5));
-        assert!(
-            !is_auth_error(&timeout),
-            "WriteTimeout must not be classified as auth error"
+        assert_eq!(classify_non_retryable_error(&io), None);
+
+        let wrapped_codex_error = acp::AcpError::AgentError {
+            code: -32000,
+            message: r#"ACP adapter error: {\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account.\"}}"#.to_string(),
+        };
+        assert_eq!(
+            classify_non_retryable_error(&wrapped_codex_error),
+            Some(NonRetryablePromptFailure::UnsupportedProviderModel)
         );
     }
 
-    // ── auth error dead-letter behavior ────────────────────────────────────
+    // ── auth error quarantine behavior ────────────────────────────────────
 
-    /// An auth-class `PromptOutcome::Error` must dead-letter immediately
-    /// (the batch is never requeued) so the user sees a re-auth hint at once
-    /// rather than after 10 futile retries.
+    /// An auth-class `PromptOutcome::Error` must be retained without an
+    /// automatic retry so the user sees a re-auth hint at once rather than
+    /// after 10 futile retries.
     #[tokio::test]
-    async fn auth_error_dead_letters_immediately_without_requeueing() {
+    async fn auth_error_quarantines_without_requeueing() {
         let keys = nostr::Keys::generate();
         let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "test")
             .sign_with_keys(&keys)
@@ -11547,6 +12108,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            recycled_settings: None,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -11571,16 +12133,29 @@ mod error_outcome_emission_tests {
             None,
         );
 
-        // The batch must not be requeued: pending_channels returns 0.
+        // The failed batch is retained but cannot be automatically re-dispatched.
         assert_eq!(
             queue.pending_channels(),
             0,
-            "auth error must dead-letter immediately — batch must not be requeued"
+            "auth error must not enter the automatic retry queue"
         );
         assert_eq!(
             queue.queued_event_count(channel_id),
             0,
-            "auth error must dead-letter immediately — no events should be pending"
+            "auth error must not leave a retryable event in the queue"
+        );
+        assert_eq!(
+            queue.quarantined_event_count(channel_id),
+            1,
+            "auth error must preserve its failed request for explicit recovery"
+        );
+        assert!(
+            queue.has_undispatched_work(),
+            "auth error must retain work instead of completing the failed request"
+        );
+        assert!(
+            !queue.has_flushable_work(),
+            "a quarantined request must not be retried by the dispatcher"
         );
     }
 
@@ -11600,8 +12175,6 @@ mod error_outcome_emission_tests {
         edit: Option<queue::ResolvedEdit>,
         lookup: serde_json::Value,
     ) -> (nostr::Event, relay::RestClient, uuid::Uuid) {
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let rest = relay::RestClient {
             http: reqwest::Client::new(),
@@ -11628,7 +12201,6 @@ mod error_outcome_emission_tests {
             code: -32002,
             message: raw_error.to_string(),
         };
-        let expected_error = model_error.to_string();
         let observer = ObserverHandle::in_process();
 
         let agent = dummy_agent(0).await;
@@ -11655,6 +12227,7 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            recycled_settings: None,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
@@ -11679,16 +12252,30 @@ mod error_outcome_emission_tests {
             Some(&rest),
         );
 
-        // The batch must not be requeued: pending_channels returns 0.
+        // The batch must not be requeued: pending_channels returns 0, while
+        // the failed request remains retained outside normal dispatch.
         assert_eq!(
             queue.pending_channels(),
             0,
-            "model-not-found must stop immediately — batch must not be requeued"
+            "model-not-found must not enter the automatic retry queue"
         );
         assert_eq!(
             queue.queued_event_count(channel_id),
             0,
-            "model-not-found must stop immediately — no events should be pending"
+            "model-not-found must not leave a retryable event in the queue"
+        );
+        assert_eq!(
+            queue.quarantined_event_count(channel_id),
+            1,
+            "model-not-found must retain the failed request for explicit recovery"
+        );
+        assert!(
+            queue.has_undispatched_work(),
+            "model-not-found must retain work instead of completing the failed request"
+        );
+        assert!(
+            !queue.has_flushable_work(),
+            "model-not-found must have zero automatic retry attempts"
         );
 
         assert!(
@@ -11703,10 +12290,41 @@ mod error_outcome_emission_tests {
             .collect();
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].payload["code"], -32002);
-        assert_eq!(errors[0].payload["error"], expected_error);
+        assert_eq!(
+            errors[0].payload["error"],
+            NonRetryablePromptFailure::ConfiguredModelUnavailable.runtime_error()
+        );
+        assert!(
+            !errors[0].payload["error"]
+                .as_str()
+                .unwrap()
+                .contains("gpt-6-astra"),
+            "turn errors must not echo the provider's model detail"
+        );
+        let lifecycles: Vec<_> = observer
+            .snapshot()
+            .into_iter()
+            .filter(|event| event.kind == "managed_agent_runtime_lifecycle")
+            .collect();
+        assert_eq!(lifecycles.len(), 1);
+        assert_eq!(lifecycles[0].payload["lifecycle"], "failed");
+        assert_eq!(
+            lifecycles[0].payload["error"],
+            NonRetryablePromptFailure::ConfiguredModelUnavailable.runtime_error()
+        );
 
         // Capture the real signed notice sent by handle_prompt_result, without a live relay.
-        let notice: nostr::Event = tokio::time::timeout(Duration::from_secs(3), async {
+        let notice = receive_failure_notice(listener, lookup).await;
+        (notice, rest, channel_id)
+    }
+
+    async fn receive_failure_notice(
+        listener: tokio::net::TcpListener,
+        lookup: serde_json::Value,
+    ) -> nostr::Event {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 let (socket, _) = listener.accept().await.unwrap();
                 let mut reader = BufReader::new(socket);
@@ -11749,8 +12367,7 @@ mod error_outcome_emission_tests {
             }
         })
         .await
-        .expect("failure notice must be posted on the first failure");
-        (notice, rest, channel_id)
+        .expect("failure notice must be posted on the first failure")
     }
 
     #[tokio::test]
@@ -11863,15 +12480,20 @@ mod error_outcome_emission_tests {
         })
     }
 
-    /// A non-auth application error (e.g. usage credits) must still follow the
-    /// standard requeue path so today's behavior is unchanged.
+    /// Ambiguous provider errors must remain on the bounded retry path.
     #[tokio::test]
-    async fn non_auth_application_error_is_requeued() {
-        assert_application_error_is_requeued(acp::AcpError::AgentError {
-            code: -32000,
-            message: "Usage credits required for 1M context".to_string(),
-        })
-        .await;
+    async fn generic_400_transient_429_and_credits_errors_are_requeued() {
+        for message in [
+            "ACP request failed: HTTP 400 bad request",
+            "ACP request failed: HTTP 429 rate limit",
+            "Usage credits required for 1M context",
+        ] {
+            assert_application_error_is_requeued(acp::AcpError::AgentError {
+                code: -32000,
+                message: message.to_string(),
+            })
+            .await;
+        }
     }
 
     #[tokio::test]
@@ -11883,7 +12505,173 @@ mod error_outcome_emission_tests {
         .await;
     }
 
-    async fn assert_application_error_is_requeued(error: acp::AcpError) {
+    #[tokio::test]
+    async fn observed_codex_chatgpt_model_rejection_pauses_all_scopes() {
+        let observed_error = r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."}}"#;
+        let (mut queue, failed_channel_id) = run_application_error(acp::AcpError::AgentError {
+            code: -32000,
+            message: observed_error.to_string(),
+        })
+        .await;
+
+        assert_nonretryable_queue_state(&mut queue, failed_channel_id);
+
+        // The production seam above runs `handle_prompt_result`; a later
+        // message in a fresh channel must remain queued rather than making a
+        // second provider request with the same rejected configuration.
+        let fresh_channel_id = uuid::Uuid::new_v4();
+        let fresh_event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "later request")
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap();
+        assert!(queue.push(QueuedEvent {
+            channel_id: fresh_channel_id,
+            scope: scope::SessionScope::Conversation {
+                channel_id: fresh_channel_id,
+            },
+            event: fresh_event,
+            prompt_tag: "test".to_string(),
+            received_at: std::time::Instant::now(),
+            edit: None,
+        }));
+        assert_eq!(queue.queued_event_count(fresh_channel_id), 1);
+        assert!(queue.has_undispatched_work());
+        assert!(!queue.has_flushable_work());
+        assert!(queue.flush_next().is_none());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_model_rejection_notifies_the_next_accepted_channel_without_dispatching() {
+        let observed_error = r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."}}"#;
+        let mut queue = run_heartbeat_application_error(acp::AcpError::AgentError {
+            code: -32000,
+            message: observed_error.to_string(),
+        })
+        .await;
+
+        assert!(queue.is_nonretryable_dispatch_paused());
+        assert!(
+            !heartbeat_dispatch_allowed(&queue, false, true),
+            "a paused runtime must not issue another heartbeat provider request"
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rest = relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+            keys: Keys::generate(),
+            auth_tag_json: None,
+        };
+        let channel_id = uuid::Uuid::new_v4();
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "later request")
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap();
+        let mut queued = NormalListenerIngress {
+            buzz_event: relay::BuzzEvent {
+                connection_generation: 0,
+                channel_id,
+                event,
+            },
+            effective_author: "test-author".to_string(),
+            prompt_tag: "test".to_string(),
+            edit: None,
+        }
+        .push(&mut queue, scope::SessionScope::Conversation { channel_id });
+
+        assert!(queued.accepted);
+        assert_eq!(
+            queued
+                .pending_nonretryable_notice
+                .as_ref()
+                .map(|notice| notice.content.as_str()),
+            Some(NonRetryablePromptFailure::UnsupportedProviderModel.notice())
+        );
+        queued.post_pending_nonretryable_notice(&rest);
+        let notice = receive_failure_notice(listener, serde_json::json!([])).await;
+        assert_eq!(notice.pubkey, rest.keys.public_key());
+        assert_eq!(
+            notice.content,
+            NonRetryablePromptFailure::UnsupportedProviderModel.notice()
+        );
+        assert!(queued.pending_nonretryable_notice.is_none());
+        assert_eq!(queue.queued_event_count(channel_id), 1);
+        assert!(!queue.has_flushable_work());
+        assert!(queue.flush_next().is_none());
+    }
+
+    #[tokio::test]
+    async fn heartbeat_model_rejection_notifies_existing_eligible_pending_work() {
+        let channel_id = uuid::Uuid::new_v4();
+        let scope = scope::SessionScope::Conversation { channel_id };
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "waiting request")
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap();
+        assert!(queue.push(QueuedEvent {
+            channel_id,
+            scope: scope.clone(),
+            event,
+            prompt_tag: "test".to_string(),
+            received_at: std::time::Instant::now(),
+            edit: None,
+        }));
+        let retryable_batch = queue.flush_next().expect("accepted request flushes once");
+        assert!(queue.requeue(retryable_batch).is_none());
+        queue.mark_complete(scope);
+        assert!(
+            !queue.has_flushable_work(),
+            "the backoff keeps the accepted request pending when the heartbeat fires"
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rest = relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+            keys: Keys::generate(),
+            auth_tag_json: None,
+        };
+        let observed_error = r#"{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."}}"#;
+        let mut queue = run_error_result(
+            queue,
+            acp::AcpError::AgentError {
+                code: -32000,
+                message: observed_error.to_string(),
+            },
+            PromptSource::Heartbeat,
+            None,
+            Some(&rest),
+        )
+        .await;
+
+        let notice = receive_failure_notice(listener, serde_json::json!([])).await;
+        assert_eq!(notice.pubkey, rest.keys.public_key());
+        assert_eq!(
+            notice.content,
+            NonRetryablePromptFailure::UnsupportedProviderModel.notice()
+        );
+        assert!(
+            !notice.content.contains("gpt-6.1-sol"),
+            "the channel notice must not expose provider payload detail"
+        );
+        assert_eq!(queue.queued_event_count(channel_id), 1);
+        assert!(queue.is_nonretryable_dispatch_paused());
+        assert!(!queue.has_flushable_work());
+        assert!(queue.flush_next().is_none());
+        assert!(
+            queue.take_nonretryable_notice().is_none(),
+            "the existing accepted request claims the one runtime notice"
+        );
+    }
+
+    #[tokio::test]
+    async fn monthly_spend_limit_is_quarantined_without_retrying() {
+        assert_nonretryable_application_error_is_quarantined(acp::AcpError::AgentError {
+            code: -32000,
+            message: "Internal error: You've hit your monthly spend limit · raise it at claude.ai/settings/usage?from=cc_cli_limit_message · your weekly limit resets 8pm (America/Chicago)".to_string(),
+        })
+        .await;
+    }
+
+    async fn run_application_error(error: acp::AcpError) -> (EventQueue, uuid::Uuid) {
         let keys = nostr::Keys::generate();
         let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "test")
             .sign_with_keys(&keys)
@@ -11902,6 +12690,36 @@ mod error_outcome_emission_tests {
             cancel_reason: None,
         };
 
+        let queue = run_error_result(
+            EventQueue::new(config::DedupMode::Queue),
+            error,
+            PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
+            Some(batch),
+            None,
+        )
+        .await;
+
+        (queue, channel_id)
+    }
+
+    async fn run_heartbeat_application_error(error: acp::AcpError) -> EventQueue {
+        run_error_result(
+            EventQueue::new(config::DedupMode::Queue),
+            error,
+            PromptSource::Heartbeat,
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn run_error_result(
+        mut queue: EventQueue,
+        error: acp::AcpError,
+        source: PromptSource,
+        batch: Option<FlushBatch>,
+        rest_client: Option<&relay::RestClient>,
+    ) -> EventQueue {
         let agent = dummy_agent(0).await;
         let mut pool = AgentPool::from_slots(vec![None]);
         let task_id = pool.join_set.spawn(async {}).id();
@@ -11918,7 +12736,6 @@ mod error_outcome_emission_tests {
                 successful_steer_deliveries: HashSet::new(),
             },
         );
-        let mut queue = EventQueue::new(config::DedupMode::Queue);
         let config = test_config();
         let mut heartbeat_in_flight = false;
         let removed_channels = std::collections::HashSet::new();
@@ -11926,15 +12743,16 @@ mod error_outcome_emission_tests {
             crash_times: Vec::new(),
             open_until: None,
             respawn_in_flight: false,
+            recycled_settings: None,
         }];
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
         let result = PromptResult {
             agent,
-            source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
+            source,
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::Error(error),
-            batch: Some(batch),
+            batch,
         };
         handle_prompt_result(
             &mut pool,
@@ -11947,20 +12765,386 @@ mod error_outcome_emission_tests {
             &respawn_tx,
             &mut respawn_tasks,
             None,
-            None,
+            rest_client,
         );
 
-        // Non-auth application error: batch IS requeued (first attempt, retry budget > 0).
+        queue
+    }
+
+    async fn assert_application_error_is_requeued(error: acp::AcpError) {
+        let (queue, channel_id) = run_application_error(error).await;
+
+        // Unclassified application error: batch IS requeued (first attempt,
+        // retry budget > 0).
         assert_eq!(
             queue.pending_channels(),
             1,
-            "non-auth application error must requeue the batch for retry"
+            "unclassified application error must requeue the batch for retry"
         );
         assert_eq!(
             queue.queued_event_count(channel_id),
             1,
-            "non-auth application error must preserve the event for retry"
+            "unclassified application error must preserve the event for retry"
         );
+    }
+
+    async fn assert_nonretryable_application_error_is_quarantined(error: acp::AcpError) {
+        let (mut queue, channel_id) = run_application_error(error).await;
+
+        assert_nonretryable_queue_state(&mut queue, channel_id);
+    }
+
+    fn assert_nonretryable_queue_state(queue: &mut EventQueue, channel_id: uuid::Uuid) {
+        assert_eq!(
+            queue.pending_channels(),
+            0,
+            "non-retryable provider failure must not enter the automatic retry queue"
+        );
+        assert_eq!(
+            queue.queued_event_count(channel_id),
+            0,
+            "non-retryable provider failure must not leave a retryable event in the queue"
+        );
+        assert_eq!(
+            queue.quarantined_event_count(channel_id),
+            1,
+            "non-retryable provider failure must preserve the failed request"
+        );
+        assert!(
+            queue.has_undispatched_work(),
+            "non-retryable provider failure must retain work instead of completing it"
+        );
+        assert!(
+            !queue.has_flushable_work(),
+            "non-retryable provider failure must have zero automatic retry attempts"
+        );
+    }
+}
+
+#[cfg(test)]
+mod session_resource_tests {
+    use super::*;
+    use crate::acp::{AcpClient, StopReason};
+    use crate::pool::{AgentPool, OwnedAgent, PromptOutcome, PromptResult, PromptSource, TaskMeta};
+    use crate::queue::{EventQueue, QueuedEvent};
+    use nostr::{EventBuilder, Keys, Kind};
+    use std::collections::HashSet;
+
+    async fn recycle_ready_agent(index: usize) -> OwnedAgent {
+        let script = r#"
+            read -r _init
+            echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentInfo":{"name":"antigravity-acp"}}}'
+            session=0
+            while read -r request; do
+                id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+                printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"session-%s"}}\n' "$id" "$session"
+                session=$((session + 1))
+            done
+        "#;
+        let mut acp = AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
+            .await
+            .expect("spawn counted ACP fixture");
+        acp.initialize()
+            .await
+            .expect("counted ACP fixture initialize");
+        for _ in 0..acp::ANTIGRAVITY_ACP_SESSION_RECYCLE_LIMIT {
+            acp.session_new_full("/tmp", vec![], None, None)
+                .await
+                .expect("counted ACP fixture session/new");
+        }
+        OwnedAgent {
+            index,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: Some("runtime-model".into()),
+            model_overridden: true,
+            desired_model_request_id: Some("pick-42".into()),
+            desired_model_pending_ack: true,
+            startup_effort: Some("high".into()),
+            agent_name: "antigravity-acp".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+        }
+    }
+
+    fn test_config() -> Config {
+        let mut config = crate::build_mcp_servers_tests::test_config();
+        config.agent_command = "true".into();
+        config.agent_args = vec![];
+        config
+    }
+
+    fn register_completed_task(pool: &mut AgentPool, channel_id: Uuid) {
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                scope: Some(scope::SessionScope::Conversation { channel_id }),
+                turn_id: "recycle-test-turn".into(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn planned_recycle_after_success_keeps_queue_empty_and_crash_budget_unchanged() {
+        let agent = recycle_ready_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let channel_id = Uuid::new_v4();
+        register_completed_task(&mut pool, channel_id);
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+            recycled_settings: None,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(1);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            PromptResult {
+                agent,
+                source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
+                turn_id: "recycle-test-turn".into(),
+                outcome: PromptOutcome::Ok(StopReason::EndTurn),
+                batch: None,
+            },
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+            None,
+        );
+
+        assert!(
+            queue.flush_next().is_none(),
+            "a successful completed prompt must not be requeued during recycle"
+        );
+        assert!(
+            pool.agents_mut()[0].is_none(),
+            "the bounded worker must be replaced instead of returned idle"
+        );
+        assert_eq!(
+            respawn_tasks.len(),
+            1,
+            "recycle must use one replacement task"
+        );
+        assert!(
+            crash_history[0].crash_times.is_empty(),
+            "a planned recycle must not consume crash budget"
+        );
+        assert!(crash_history[0].respawn_in_flight);
+        respawn_tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn planned_recycle_preserves_cancelled_batch_and_runtime_model_state() {
+        let agent = recycle_ready_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let channel_id = Uuid::new_v4();
+        register_completed_task(&mut pool, channel_id);
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let event = EventBuilder::new(Kind::Custom(9), "cancelled work")
+            .sign_with_keys(&Keys::generate())
+            .expect("sign cancellation fixture");
+        let event_id = event.id.to_hex();
+        queue.push(QueuedEvent {
+            edit: None,
+            channel_id,
+            scope: scope::SessionScope::Conversation { channel_id },
+            event,
+            prompt_tag: "test".into(),
+            received_at: std::time::Instant::now(),
+        });
+        let batch = queue.flush_next().expect("fixture batch must dispatch");
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+            recycled_settings: None,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(1);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            PromptResult {
+                agent,
+                source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
+                turn_id: "recycle-test-turn".into(),
+                outcome: PromptOutcome::Cancelled,
+                batch: Some(batch),
+            },
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+            None,
+        );
+
+        let preserved = queue
+            .flush_next()
+            .expect("cancelled batch must survive planned recycle");
+        let preserved_ids: Vec<_> = preserved
+            .events
+            .iter()
+            .chain(&preserved.cancelled_events)
+            .map(|event| event.event.id.to_hex())
+            .collect();
+        assert_eq!(preserved_ids, [event_id]);
+        assert!(
+            crash_history[0].crash_times.is_empty(),
+            "a planned recycle must not consume crash budget"
+        );
+
+        assert!(complete_respawn_result(
+            &mut pool,
+            &mut crash_history,
+            RespawnResult {
+                index: 0,
+                result: Ok((
+                    AcpClient::spawn("cat", &[], &[], false)
+                        .await
+                        .expect("spawn replacement fixture"),
+                    1,
+                    "antigravity-acp".into(),
+                )),
+            },
+            &config,
+        ));
+        let replacement = pool.agents_mut()[0]
+            .take()
+            .expect("successful planned recycle must return its replacement");
+        assert_eq!(replacement.desired_model.as_deref(), Some("runtime-model"));
+        assert!(replacement.model_overridden);
+        assert_eq!(
+            replacement.desired_model_request_id.as_deref(),
+            Some("pick-42")
+        );
+        assert!(replacement.desired_model_pending_ack);
+        assert_eq!(replacement.startup_effort.as_deref(), Some("high"));
+        assert!(
+            crash_history[0].recycled_settings.is_none(),
+            "a successful replacement consumes the saved runtime state exactly once"
+        );
+        let mut replacement = replacement;
+        replacement.acp.shutdown().await;
+        respawn_tasks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn planned_recycle_failure_cools_down_then_restores_runtime_state() {
+        let settings = RecycledAgentSettings {
+            desired_model: Some("runtime-model".into()),
+            model_overridden: true,
+            desired_model_request_id: Some("pick-42".into()),
+            desired_model_pending_ack: true,
+            startup_effort: Some("high".into()),
+        };
+        let prior_crash = std::time::Instant::now() - Duration::from_secs(1);
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: vec![prior_crash],
+            open_until: None,
+            respawn_in_flight: true,
+            recycled_settings: Some(settings),
+        }];
+        let config = test_config();
+
+        assert!(!complete_respawn_result(
+            &mut pool,
+            &mut crash_history,
+            RespawnResult {
+                index: 0,
+                result: Err(anyhow::anyhow!("replacement initialize failed")),
+            },
+            &config,
+        ));
+        assert!(
+            crash_history[0].open_until.is_some(),
+            "a failed planned replacement must enter the bounded cooldown"
+        );
+        assert!(
+            !crash_history[0].can_refill(),
+            "maintenance must not retry a planned replacement before cooldown"
+        );
+        let saved = crash_history[0]
+            .recycled_settings
+            .as_ref()
+            .expect("maintenance retry must retain planned replacement state");
+        assert_eq!(saved.desired_model.as_deref(), Some("runtime-model"));
+        assert!(saved.model_overridden);
+        assert_eq!(saved.desired_model_request_id.as_deref(), Some("pick-42"));
+        assert!(saved.desired_model_pending_ack);
+        assert_eq!(saved.startup_effort.as_deref(), Some("high"));
+        assert_eq!(crash_history[0].crash_times.as_slice(), &[prior_crash]);
+        assert!(!crash_history[0].respawn_in_flight);
+
+        // SlotCircuit deliberately uses std::time::Instant, which Tokio's
+        // paused time does not advance. Expire the cooldown directly to reach
+        // the same maintenance refill branch deterministically.
+        crash_history[0].open_until = Some(std::time::Instant::now() - Duration::from_secs(1));
+        assert!(
+            crash_history[0].can_refill(),
+            "maintenance must retry the planned replacement after cooldown"
+        );
+        assert_eq!(
+            crash_history[0].crash_times.as_slice(),
+            &[prior_crash],
+            "planned replacement cooldown must not reseed crash history"
+        );
+        assert!(crash_history[0].recycled_settings.is_some());
+
+        assert!(complete_respawn_result(
+            &mut pool,
+            &mut crash_history,
+            RespawnResult {
+                index: 0,
+                result: Ok((
+                    AcpClient::spawn("cat", &[], &[], false)
+                        .await
+                        .expect("spawn replacement fixture"),
+                    1,
+                    "antigravity-acp".into(),
+                )),
+            },
+            &config,
+        ));
+        let mut replacement = pool.agents_mut()[0]
+            .take()
+            .expect("eventual replacement must return to the pool");
+        assert_eq!(replacement.desired_model.as_deref(), Some("runtime-model"));
+        assert!(replacement.model_overridden);
+        assert_eq!(
+            replacement.desired_model_request_id.as_deref(),
+            Some("pick-42")
+        );
+        assert!(replacement.desired_model_pending_ack);
+        assert_eq!(replacement.startup_effort.as_deref(), Some("high"));
+        assert!(crash_history[0].recycled_settings.is_none());
+        replacement.acp.shutdown().await;
     }
 }
 

@@ -215,9 +215,9 @@ test("friendlyTurnErrorCopy: garbage string code coerces to NaN → string path"
   );
 });
 
-// --- -32603 internal error (Fix #2: CLI-ACP unsupported model hint) ---
+// --- -32603 internal error guidance ---
 
-test("code -32603 bare 'Internal error' → cli-acp internal error hint (severity: generic)", () => {
+test("code -32603 bare 'Internal error' → provider-neutral guidance (severity: generic)", () => {
   const result = friendlyAgentLastError("Internal error", -32603);
   assert.deepEqual(result, {
     severity: "generic",
@@ -225,10 +225,10 @@ test("code -32603 bare 'Internal error' → cli-acp internal error hint (severit
   });
 });
 
-test("code -32603 bare Internal error (wrapped) → cli-acp internal error hint", () => {
+test("code -32603 bare Internal error (wrapped) → provider-neutral guidance", () => {
   // The ACP wrapper form "Agent reported error (code -32603): Internal error"
   // is treated as bare — the remainder after stripping the prefix is
-  // "Internal error", which maps to the hint.
+  // "Internal error", which maps to the guidance.
   const result = friendlyAgentLastError(
     "Agent reported error (code -32603): Internal error",
     -32603,
@@ -241,7 +241,7 @@ test("code -32603 bare Internal error (wrapped) → cli-acp internal error hint"
 
 test("code -32603 with specific message → original message preserved, NOT hint", () => {
   // If the adapter provides detail beyond "Internal error", preserve it —
-  // don't bury actionable information with a broad codex-specific hint.
+  // don't bury actionable information with generic guidance.
   const result = friendlyAgentLastError(
     "Internal error: model gpt-5.6-sol rejected by adapter",
     -32603,
@@ -299,7 +299,7 @@ test("friendlyTurnErrorCopy: -32603 structured param + wrapped specific detail �
   );
 });
 
-test("friendlyTurnErrorCopy: code -32603 bare Internal error → cli-acp internal error hint", () => {
+test("friendlyTurnErrorCopy: code -32603 bare Internal error → provider-neutral guidance", () => {
   assert.equal(
     friendlyTurnErrorCopy("Internal error", -32603),
     CLI_ACP_INTERNAL_ERROR_COPY,

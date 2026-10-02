@@ -4,7 +4,7 @@ import type {
   WorkflowEditorCreateTarget,
   WorkflowEditorWorkflowTarget,
 } from "@/features/workflows/ui/WorkflowEditorHost";
-import type { Channel } from "@/shared/api/types";
+import type { Channel, Workflow } from "@/shared/api/types";
 import { ViewLoadingFallback } from "@/shared/ui/ViewLoadingFallback";
 import type { WorkflowEditorPane } from "./workflowEditorPane";
 
@@ -24,9 +24,9 @@ type WorkflowsScreenProps = {
   editor: WorkflowEditorRoute | null;
   onCloseEditor: () => void;
   onCreateWorkflow: () => void;
-  onDuplicateWorkflow: (workflowId: string) => void;
-  onEditWorkflow: (workflowId: string) => void;
-  onViewWorkflow: (workflowId: string) => void;
+  onDuplicateWorkflow: (workflow: Workflow) => void;
+  onEditWorkflow: (workflow: Workflow) => void;
+  onViewWorkflow: (workflow: Workflow) => void;
   onEditorPaneChange: (pane: WorkflowEditorPane) => void;
 };
 

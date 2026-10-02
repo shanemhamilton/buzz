@@ -43,7 +43,7 @@ export const MODEL_NOT_FOUND_COPY =
   "The configured model is not available — open agent settings and select a different one from the dropdown.";
 
 export const CLI_ACP_INTERNAL_ERROR_COPY =
-  "The agent's harness reported an internal error. For Codex agents this can mean the configured model isn't supported by your installed codex-acp — check the model in `~/.codex/config.toml` or upgrade the adapter (`brew upgrade codex-acp`).";
+  "The agent's harness reported an internal error. Inspect this agent's session and runtime logs for details.";
 
 const EMBEDDED_CODE_RE = /^Agent reported error \(code (-?\d+)\): /;
 /** Bare form of the standard JSON-RPC -32603 message (after stripping the ACP wrapper prefix). */
@@ -82,11 +82,10 @@ export function friendlyAgentLastError(
       case -32002:
         return { severity: "denied", copy: MODEL_NOT_FOUND_COPY };
       case -32603: {
-        // Standard JSON-RPC "Internal error" — emitted by external harnesses
-        // (e.g. codex-acp) when the configured model is unsupported. Only
-        // substitute the hint when the message is the bare "Internal error"
-        // form; if the adapter included specific detail, preserve it so we
-        // don't bury actionable information with a broad codex-specific hint.
+        // Standard JSON-RPC "Internal error" from an external harness. Only
+        // substitute the guidance when the message is the bare "Internal
+        // error" form; if the adapter included specific detail, preserve it
+        // so the UI retains the actionable cause.
         //
         // "Bare" means the remainder after stripping the ACP wrapper prefix
         // (if present) is exactly "Internal error". This covers both the raw

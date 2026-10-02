@@ -23,6 +23,10 @@ import {
 } from "@/features/workflows/ui/workflowDefinition";
 import type { Channel, Workflow } from "@/shared/api/types";
 import {
+  workflowIdentityKey,
+  workflowMatchesReference,
+} from "@/shared/api/workflowTypes";
+import {
   deleteWorkflow,
   getChannelsWorkflows,
   triggerWorkflow,
@@ -47,9 +51,9 @@ type WorkflowsViewProps = {
   editor: WorkflowEditorRoute | null;
   onCloseEditor: () => void;
   onCreateWorkflow: () => void;
-  onDuplicateWorkflow: (workflowId: string) => void;
-  onEditWorkflow: (workflowId: string) => void;
-  onViewWorkflow: (workflowId: string) => void;
+  onDuplicateWorkflow: (workflow: Workflow) => void;
+  onEditWorkflow: (workflow: Workflow) => void;
+  onViewWorkflow: (workflow: Workflow) => void;
   onEditorPaneChange: (pane: WorkflowEditorPane) => void;
 };
 
@@ -116,8 +120,14 @@ export function WorkflowsView({
     React.useState<Workflow | null>(null);
   const queryClient = useQueryClient();
 
-  const editorWorkflowId =
-    editor && editor.mode !== "create" ? editor.workflowId : null;
+  const editorWorkflowReference =
+    editor && editor.mode !== "create"
+      ? {
+          channelId: editor.channelId,
+          id: editor.workflowId,
+          ownerPubkey: editor.ownerPubkey,
+        }
+      : null;
 
   const memberChannels = channels.filter((c) => c.isMember);
   const channelIds = memberChannels.map((c) => c.id).sort();
@@ -162,7 +172,7 @@ export function WorkflowsView({
   });
 
   const deleteMutation = useMutation({
-    mutationFn: (workflowId: string) => deleteWorkflow(workflowId),
+    mutationFn: (workflow: Workflow) => deleteWorkflow(workflow),
     onSuccess: () => {
       void queryClient.invalidateQueries({
         predicate: (query) =>
@@ -175,14 +185,13 @@ export function WorkflowsView({
   const toggleEnabledMutation = useMutation({
     mutationFn: (workflow: Workflow) =>
       updateWorkflow(
-        workflow.id,
+        workflow,
         yamlStringify(
           withWorkflowEnabled(
             workflow.definition,
             !getWorkflowEnabled(workflow.definition),
           ),
         ),
-        workflow.revision,
       ),
     onError: (error) => {
       toast.error("Couldn’t change workflow status", {
@@ -195,7 +204,7 @@ export function WorkflowsView({
     onSuccess: (_data, workflow) => {
       setActivationTarget(null);
       void queryClient.invalidateQueries({
-        queryKey: workflowQueryKey(workflow.id),
+        queryKey: workflowQueryKey(workflow),
       });
       void queryClient.invalidateQueries({
         predicate: (query) =>
@@ -220,30 +229,35 @@ export function WorkflowsView({
   const handleConfirmDelete = React.useCallback(
     async (workflow: Workflow) => {
       try {
-        await deleteOne(workflow.id);
+        await deleteOne(workflow);
         setDeleteTarget(null);
         // Deleting the workflow the editor is pointed at would otherwise leave
         // that editor open on a workflow that no longer exists.
-        if (workflow.id === editorWorkflowId) onCloseEditor();
+        if (
+          editorWorkflowReference &&
+          workflowMatchesReference(workflow, editorWorkflowReference)
+        ) {
+          onCloseEditor();
+        }
       } catch {
         // React Query stores the error; keep the confirmation and editor open.
       }
     },
-    [deleteOne, editorWorkflowId, onCloseEditor],
+    [deleteOne, editorWorkflowReference, onCloseEditor],
   );
 
   const handleView = React.useCallback(
-    (workflow: Workflow) => onViewWorkflow(workflow.id),
+    (workflow: Workflow) => onViewWorkflow(workflow),
     [onViewWorkflow],
   );
 
   const handleEdit = React.useCallback(
-    (workflow: Workflow) => onEditWorkflow(workflow.id),
+    (workflow: Workflow) => onEditWorkflow(workflow),
     [onEditWorkflow],
   );
 
   const handleDuplicate = React.useCallback(
-    (workflow: Workflow) => onDuplicateWorkflow(workflow.id),
+    (workflow: Workflow) => onDuplicateWorkflow(workflow),
     [onDuplicateWorkflow],
   );
 
@@ -266,7 +280,9 @@ export function WorkflowsView({
     : null;
 
   const editorWorkflowHint = allWorkflows.find(
-    ({ workflow }) => workflow.id === editorWorkflowId,
+    ({ workflow }) =>
+      editorWorkflowReference !== null &&
+      workflowMatchesReference(workflow, editorWorkflowReference),
   )?.workflow;
 
   return (
@@ -315,14 +331,22 @@ export function WorkflowsView({
               <CreateWorkflowCard onClick={onCreateWorkflow} />
               {allWorkflows.map(({ workflow, channelName }) => (
                 <WorkflowCard
-                  authorPresentation={authorPresentations.get(workflow.id)}
+                  authorPresentation={authorPresentations.get(
+                    workflowIdentityKey(workflow),
+                  )}
                   channelName={channelName}
                   isTogglingEnabled={
                     toggleEnabledMutation.isPending &&
-                    toggleEnabledMutation.variables?.id === workflow.id
+                    toggleEnabledMutation.variables !== undefined &&
+                    workflowMatchesReference(
+                      toggleEnabledMutation.variables,
+                      workflow,
+                    )
                   }
-                  key={workflow.id}
-                  messagePresentation={messagePresentations.get(workflow.id)}
+                  key={workflowIdentityKey(workflow)}
+                  messagePresentation={messagePresentations.get(
+                    workflowIdentityKey(workflow),
+                  )}
                   onDelete={handleDelete}
                   onDuplicate={handleDuplicate}
                   onEdit={handleEdit}

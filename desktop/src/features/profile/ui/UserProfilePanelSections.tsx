@@ -61,6 +61,7 @@ export type ProfileSummaryViewProps = {
   activityAgent: ProfileActivityAgent | null;
   canAddToChannel: boolean;
   canDeleteAgent: boolean;
+  deleteActionLabel?: string;
   canEditAgent: boolean;
   canOpenAgentLogs: boolean;
   canViewActivity: boolean;
@@ -137,6 +138,7 @@ export function ProfileSummaryView({
   activityAgent,
   canAddToChannel,
   canDeleteAgent,
+  deleteActionLabel,
   canEditAgent,
   canOpenAgentLogs,
   canViewActivity,
@@ -517,6 +519,7 @@ export function ProfileSummaryView({
                 archiveActions={archiveActions}
                 canArchiveAgent={isBot && archiveActions.canArchive}
                 canDeleteAgent={canDeleteAgent}
+                deleteActionLabel={deleteActionLabel}
                 channelIdToName={channelIdToName}
                 isArchived={isArchived}
                 isDeleteAgentPending={isAgentActionPending}

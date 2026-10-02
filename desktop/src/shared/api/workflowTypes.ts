@@ -12,6 +12,32 @@ export type Workflow = {
   updatedAt: number;
 };
 
+/**
+ * The stable identity of a parameterized-replaceable workflow definition.
+ * A workflow UUID (`d` tag) is only unique within its author; the channel is
+ * retained so the desktop never opens a same-UUID definition from another
+ * channel by accident.
+ */
+export type WorkflowReference = Pick<
+  Workflow,
+  "id" | "ownerPubkey" | "channelId"
+>;
+
+export function workflowIdentityKey({
+  channelId,
+  id,
+  ownerPubkey,
+}: WorkflowReference): string {
+  return [ownerPubkey, id, channelId ?? ""].join(":");
+}
+
+export function workflowMatchesReference(
+  workflow: Workflow,
+  reference: WorkflowReference,
+): boolean {
+  return workflowIdentityKey(workflow) === workflowIdentityKey(reference);
+}
+
 export type WorkflowSaveResult = {
   workflow: Workflow;
   webhookSecret: string | null;

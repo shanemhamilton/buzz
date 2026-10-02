@@ -262,12 +262,12 @@ export function ChannelManagementSheet({
   // canonical /workflows deep links stay unchanged either way.
   function handleOpenWorkflow(workflow: Workflow) {
     if (openWorkflowOverlay) {
-      openWorkflowOverlay(workflow.id, workflow);
+      openWorkflowOverlay(workflow);
       return;
     }
 
     handlePanelOpenChange(false);
-    void goWorkflow(workflow.id);
+    void goWorkflow(workflow);
   }
 
   function handleCreateWorkflow() {

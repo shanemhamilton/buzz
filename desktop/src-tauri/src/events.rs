@@ -789,6 +789,24 @@ mod tests {
         assert!(build_create_channel(channel_id, "###", "open", "stream", None, None).is_err());
         assert!(build_update_channel(channel_id, Some("###"), None, None, None).is_err());
     }
+
+    #[test]
+    fn workflow_delete_targets_the_supplied_owner_coordinate() {
+        let owner = "a".repeat(64);
+        let workflow_id = Uuid::new_v4().to_string();
+        let event = build_workflow_delete(&workflow_id, &owner)
+            .expect("workflow delete builder accepts a valid owner")
+            .sign_with_keys(&Keys::generate())
+            .expect("workflow delete event can be signed");
+        let coordinate = event
+            .tags
+            .iter()
+            .find(|tag| tag.kind().to_string() == "a")
+            .and_then(|tag| tag.content());
+
+        let expected_coordinate = format!("30620:{owner}:{workflow_id}");
+        assert_eq!(coordinate, Some(expected_coordinate.as_str()));
+    }
     /// Builder layout regression for the NIP-IA owner-of-agent archive flow.
     /// Compares against `docs/nips/NIP-IA.md` §Vector 1.
     #[test]

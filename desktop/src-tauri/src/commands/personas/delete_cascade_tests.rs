@@ -8,6 +8,7 @@
 
 use super::{collect_cascade_pubkeys, collect_remote_deployed, commit_cascade_agents};
 use crate::managed_agents::{BackendKind, ManagedAgentRecord, RespondTo};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 
@@ -142,10 +143,9 @@ fn cascade_includes_running_agent() {
 }
 
 /// A failing agent-store save in Phase 3 must be retry-safe: the error
-/// propagates before any keyring deletion or tombstone at the call site
-/// (by construction — those side effects appear after the `?` in
-/// `delete_persona`). Persona records and agent records are therefore
-/// untouched on disk, so the command can be retried with no cleanup.
+/// propagates before any keyring deletion. The command now secures the
+/// tombstone/archive retry record before this commit, so local records remain
+/// untouched and a retry may re-enter idempotently with that record present.
 #[test]
 fn failing_save_is_retry_safe() {
     let mut agents = vec![
@@ -155,17 +155,68 @@ fn failing_save_is_retry_safe() {
     ];
     let cascade: HashSet<String> = ["pk-a".to_string(), "pk-b".to_string()].into();
 
-    let result = commit_cascade_agents(&mut agents, &cascade, |_| {
-        Err("simulated disk failure".to_string())
-    });
+    let cleanup_calls = RefCell::new(0);
+    let result = commit_cascade_agents(
+        &mut agents,
+        &cascade,
+        |_| Err("simulated disk failure".to_string()),
+        |_| *cleanup_calls.borrow_mut() += 1,
+    );
 
     assert!(
         result.is_err(),
         "commit must propagate the save error so callers can react"
     );
-    // By construction: commit_cascade_agents returns Err before reaching the
-    // keyring deletions and tombstones at the delete_persona call site.
-    // Retrying delete_persona re-runs the full cascade cleanly from scratch.
+    assert_eq!(
+        *cleanup_calls.borrow(),
+        0,
+        "failed agent-record save must retain local caches and keys"
+    );
+}
+
+/// A later persona-store failure cannot defer cache/key cleanup: after the
+/// agent-record save succeeds the cascade records are gone, so a retry's empty
+/// cascade has no way to find leaked local keys.
+#[test]
+fn persona_save_failure_follows_agent_cleanup() {
+    let mut agents = vec![
+        make_agent("pk-a", Some(PERSONA_ID), None),
+        make_agent("pk-b", Some(PERSONA_ID), None),
+        make_agent("pk-c", Some("custom:other"), None),
+    ];
+    let cascade: HashSet<String> = ["pk-a".to_string(), "pk-b".to_string()].into();
+    let sequence = RefCell::new(Vec::new());
+
+    commit_cascade_agents(
+        &mut agents,
+        &cascade,
+        |_| {
+            sequence.borrow_mut().push("agent save");
+            Ok(())
+        },
+        |_| sequence.borrow_mut().push("agent cache/key cleanup"),
+    )
+    .expect("agent records save successfully");
+
+    sequence.borrow_mut().push("persona save");
+    let persona_save: Result<(), String> = Err("simulated persona disk failure".to_string());
+    assert!(
+        persona_save.is_err(),
+        "the second save fails after agent cleanup"
+    );
+    assert_eq!(
+        sequence.into_inner(),
+        vec!["agent save", "agent cache/key cleanup", "persona save"],
+        "cleanup must occur before the independently failing persona save"
+    );
+    assert_eq!(
+        agents
+            .iter()
+            .map(|agent| agent.pubkey.as_str())
+            .collect::<Vec<_>>(),
+        vec!["pk-c"],
+        "the successful agent save leaves retry with an empty cascade"
+    );
 }
 
 /// A provider-deployed cascade target (non-local backend with a live

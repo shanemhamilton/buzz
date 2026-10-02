@@ -1,7 +1,13 @@
 import * as React from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
-import type { WorkflowRun, WorkflowRunStatus } from "@/shared/api/types";
+import type {
+  Workflow,
+  WorkflowReference,
+  WorkflowRun,
+  WorkflowRunStatus,
+} from "@/shared/api/types";
+import { workflowIdentityKey } from "@/shared/api/workflowTypes";
 import {
   useAppFocused,
   useFocusedRefetchInterval,
@@ -92,8 +98,8 @@ export const allWorkflowsQueryKey = (channelIdKey: string) =>
   ["workflows-all", channelIdKey] as const;
 export const workflowsQueryKey = (channelId: string) =>
   ["workflows", channelId] as const;
-export const workflowQueryKey = (workflowId: string) =>
-  ["workflow", workflowId] as const;
+export const workflowQueryKey = (workflow: WorkflowReference) =>
+  ["workflow", workflowIdentityKey(workflow)] as const;
 export const workflowRunsQueryKey = (workflowId: string) =>
   ["workflow-runs", workflowId] as const;
 export const runApprovalsQueryKey = (workflowId: string, runId: string) =>
@@ -127,12 +133,18 @@ export function useChannelWorkflowsQuery(channelId: string | null) {
   });
 }
 
-export function useWorkflowQuery(workflowId: string | null) {
+export function useWorkflowQuery(workflow: WorkflowReference | null) {
   return useQuery({
-    queryKey: workflowQueryKey(workflowId ?? ""),
-    queryFn: ({ queryKey: [, resolvedWorkflowId] }) =>
-      getWorkflow(resolvedWorkflowId),
-    enabled: workflowId !== null,
+    queryKey: workflowQueryKey(
+      workflow ?? { channelId: null, id: "", ownerPubkey: "" },
+    ),
+    queryFn: () => {
+      if (!workflow) {
+        return Promise.reject(new Error("workflow is required"));
+      }
+      return getWorkflow(workflow);
+    },
+    enabled: workflow !== null,
     staleTime: 30_000,
   });
 }
@@ -186,28 +198,33 @@ export function useCreateWorkflowMutation(channelId: string) {
 }
 
 export function useUpdateWorkflowMutation(
-  workflowId: string,
-  workflowRevision: string,
+  workflow: Workflow | null | undefined,
 ) {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (yamlDefinition: string) =>
-      updateWorkflow(workflowId, yamlDefinition, workflowRevision),
+    mutationFn: (yamlDefinition: string) => {
+      if (!workflow) {
+        return Promise.reject(new Error("workflow is required"));
+      }
+      return updateWorkflow(workflow, yamlDefinition);
+    },
     onSuccess: () => {
-      void queryClient.invalidateQueries({
-        queryKey: workflowQueryKey(workflowId),
-      });
+      if (workflow) {
+        void queryClient.invalidateQueries({
+          queryKey: workflowQueryKey(workflow),
+        });
+      }
       invalidateWorkflowListQueries(queryClient);
     },
   });
 }
 
-export function useDeleteWorkflowMutation(workflowId: string) {
+export function useDeleteWorkflowMutation(workflow: Workflow) {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: () => deleteWorkflow(workflowId),
+    mutationFn: () => deleteWorkflow(workflow),
     onSuccess: () => {
       invalidateWorkflowListQueries(queryClient);
     },

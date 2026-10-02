@@ -29,6 +29,14 @@ const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
 /// Package and binary name used by Buzz's Pi ACP fork.
 pub(crate) const BUZZ_PI_ACP_NAME: &str = "buzz-pi-acp";
 
+/// `antigravity-acp` does not advertise session close support. Bound its
+/// successful `session/new` lifetime with a worker recycle so resources owned
+/// by that adapter cannot grow without a process-level cleanup.
+const ANTIGRAVITY_ACP_NAME: &str = "antigravity-acp";
+/// Leaves headroom below the observed 60 retained sessions at a 256-FD soft
+/// limit while bounding one ACP child process to a small, fixed lifetime.
+pub(crate) const ANTIGRAVITY_ACP_SESSION_RECYCLE_LIMIT: usize = 16;
+
 /// An MCP server configuration passed to `session/new`.
 ///
 /// Corresponds to the `McpServerStdio` variant in the ACP schema.
@@ -221,6 +229,13 @@ pub struct AcpClient {
     standard_usage: StandardUsageTracker,
     /// Known adapter identity for prompt-response usage mapping.
     standard_adapter: Option<StandardAdapterKind>,
+    /// Session count at which this process must be replaced after a completed
+    /// prompt. Set only for adapters with known retained-session resources.
+    session_recycle_limit: Option<usize>,
+    /// Successful `session/new` calls made by this ACP process. This lives on
+    /// the client rather than SessionState so session invalidation cannot reset
+    /// the resource bound.
+    successful_session_creations: usize,
 }
 
 /// Recursively merge `overlay` into `base`, with `overlay` winning on scalar/shape
@@ -623,6 +638,8 @@ impl AcpClient {
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
             standard_adapter,
+            session_recycle_limit: None,
+            successful_session_creations: 0,
         })
     }
 
@@ -677,6 +694,13 @@ impl AcpClient {
             .pointer("/_meta/steering/supported")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        self.session_recycle_limit = result
+            .get("agentInfo")
+            .or_else(|| result.get("serverInfo"))
+            .and_then(|info| info.get("name"))
+            .and_then(|name| name.as_str())
+            .filter(|name| name.trim() == ANTIGRAVITY_ACP_NAME)
+            .map(|_| ANTIGRAVITY_ACP_SESSION_RECYCLE_LIMIT);
         tracing::debug!(target: "acp::init", "initialize response: {result}");
         Ok(result)
     }
@@ -743,11 +767,22 @@ impl AcpClient {
             .as_str()
             .ok_or_else(|| AcpError::Protocol("session/new response missing sessionId".into()))?
             .to_owned();
+        if self.session_recycle_limit.is_some() {
+            self.successful_session_creations = self.successful_session_creations.saturating_add(1);
+        }
         tracing::info!(target: "acp::session", "session created: {session_id}");
         Ok(SessionNewResponse {
             session_id,
             raw: result,
         })
+    }
+
+    /// Whether this reusable worker reached its adapter-specific session bound
+    /// and is idle enough to replace safely.
+    pub(crate) fn should_recycle_after_completed_prompt(&self) -> bool {
+        self.session_recycle_limit
+            .is_some_and(|limit| self.successful_session_creations >= limit)
+            && !self.has_in_flight_prompt()
     }
 
     /// Send `session/new` and return only the `sessionId` string.
@@ -3094,6 +3129,34 @@ mod tests {
             .expect("failed to spawn test script")
     }
 
+    async fn initialized_session_counter(name: &str) -> AcpClient {
+        let script = format!(
+            r#"
+                read -r _init
+                echo '{{"jsonrpc":"2.0","id":0,"result":{{"protocolVersion":1,"agentInfo":{{"name":"{name}"}}}}}}'
+                session=0
+                while read -r request; do
+                    id=$(printf '%s' "$request" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+                    printf '{{"jsonrpc":"2.0","id":%s,"result":{{"sessionId":"session-%s"}}}}\n' "$id" "$session"
+                    session=$((session + 1))
+                done
+            "#
+        );
+        let mut client = spawn_script(&script).await;
+        client
+            .initialize()
+            .await
+            .expect("test adapter initialize should succeed");
+        client
+    }
+
+    async fn create_test_session(client: &mut AcpClient) {
+        client
+            .session_new_full("/tmp", vec![], None, None)
+            .await
+            .expect("test session/new should succeed");
+    }
+
     #[cfg(unix)]
     async fn spawn_named_script(name: &str, script: &str) -> (AcpClient, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
@@ -3553,6 +3616,48 @@ mod tests {
             Some("Custom system prompt"),
             "systemPrompt should be included in params when Some"
         );
+    }
+
+    #[tokio::test]
+    async fn session_resource_antigravity_recycles_only_after_16_completed_sessions() {
+        let mut client = initialized_session_counter(ANTIGRAVITY_ACP_NAME).await;
+
+        for _ in 0..(ANTIGRAVITY_ACP_SESSION_RECYCLE_LIMIT - 1) {
+            create_test_session(&mut client).await;
+            assert!(
+                !client.should_recycle_after_completed_prompt(),
+                "the worker must remain usable below its session limit"
+            );
+        }
+
+        create_test_session(&mut client).await;
+        assert!(
+            client.should_recycle_after_completed_prompt(),
+            "the worker must recycle after its sixteenth successful session/new"
+        );
+
+        client.last_prompt_id = Some(99);
+        assert!(
+            !client.should_recycle_after_completed_prompt(),
+            "a recycle must never terminate an active prompt"
+        );
+        client.last_prompt_id = None;
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn session_resource_recycle_limit_does_not_apply_to_other_adapters() {
+        let mut client = initialized_session_counter("another-acp-adapter").await;
+
+        for _ in 0..ANTIGRAVITY_ACP_SESSION_RECYCLE_LIMIT {
+            create_test_session(&mut client).await;
+        }
+
+        assert!(
+            !client.should_recycle_after_completed_prompt(),
+            "only the named adapter receives the bounded recycle policy"
+        );
+        client.shutdown().await;
     }
 
     #[tokio::test]

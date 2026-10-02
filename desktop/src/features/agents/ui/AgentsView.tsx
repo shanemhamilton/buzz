@@ -380,9 +380,7 @@ export function AgentsView() {
               (a) => a.personaId === personas.personaToDelete?.id,
             ).length
           }
-          onConfirm={(persona) => {
-            void personas.handleDelete(persona);
-          }}
+          onConfirm={personas.handleDelete}
           onOpenChange={(open) => {
             if (!open) {
               personas.setPersonaToDelete(null);

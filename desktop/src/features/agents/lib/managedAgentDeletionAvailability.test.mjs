@@ -122,7 +122,12 @@ function setup() {
 
 function mount(
   owner,
-  { agents = [agent], keys = [PK], seedChannels = true } = {},
+  {
+    agents = [agent],
+    channels = [channel],
+    keys = [PK],
+    seedChannels = true,
+  } = {},
 ) {
   const client = new QueryClient({
     defaultOptions: {
@@ -133,7 +138,7 @@ function mount(
   clients.push(client);
   client.setQueryData(["managed-agents"], agents);
   client.setQueryData(["relay-agents"], directory);
-  if (seedChannels) client.setQueryData(["channels"], [channel]);
+  if (seedChannels) client.setQueryData(["channels"], channels);
   client.setQueryData(["globalAgentConfig"], { env_vars: {} });
   let current;
   function AgentsSurface() {
@@ -143,7 +148,7 @@ function mount(
   function ProfileSurface() {
     const availability = useAgentAvailabilityLookup(keys);
     const deletion = useProfileAgentDeletion({
-      channels: [channel],
+      channels,
       managedAgents: agents,
       managedAgent: agents[0],
       relayAgents: agents.map((row) => ({
@@ -284,6 +289,63 @@ test("reader retained across an await sees errors/disconnect, not cached success
   );
   connection = "reconnecting"; // even before the next React connection render
   assert.equal(retainedReader(PK), undefined);
+});
+
+test("profile retry only repeats failed roster cleanup after the native delete", async () => {
+  setup();
+  const staleChannel = {
+    id: "stale-channel",
+    name: "stale roster",
+    memberPubkeys: [PK],
+  };
+  let staleRemovalFailed = false;
+  handlers.set("remove_channel_member", ({ channelId }) => {
+    if (channelId === staleChannel.id && !staleRemovalFailed) {
+      staleRemovalFailed = true;
+      throw new Error("relay roster write failed");
+    }
+    return null;
+  });
+  const surface = mount("profile", { channels: [channel, staleChannel] });
+  await waitFor(() =>
+    assert.equal(surface.current().getAvailability(PK), "online"),
+  );
+
+  let first;
+  await act(async () => {
+    first = await surface.current().deleteManagedAgentRecord(agent);
+  });
+  assert.match(first.cleanupError, /could not remove the agent from 1 channel/);
+  assert.equal(
+    commands.filter(([name]) => name === "delete_managed_agent").length,
+    1,
+    "the native delete must run once before recovery is needed",
+  );
+  assert.deepEqual(
+    commands
+      .filter(([name]) => name === "remove_channel_member")
+      .map(([, args]) => args.channelId),
+    [channel.id, staleChannel.id],
+    "the first pass cleans both the directory and stale cached roster",
+  );
+
+  let retry;
+  await act(async () => {
+    retry = await surface.current().deleteManagedAgentRecord(agent);
+  });
+  assert.equal(retry.cleanupError, undefined);
+  assert.equal(
+    commands.filter(([name]) => name === "delete_managed_agent").length,
+    1,
+    "retry must not invoke the destructive native delete again",
+  );
+  assert.deepEqual(
+    commands
+      .filter(([name]) => name === "remove_channel_member")
+      .map(([, args]) => args.channelId),
+    [channel.id, staleChannel.id, staleChannel.id],
+    "retry repeats only the failed roster write",
+  );
 });
 
 for (const owner of ["agents", "profile"]) {

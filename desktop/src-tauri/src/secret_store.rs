@@ -582,6 +582,7 @@ impl SecretStore {
     /// Returns the full key→value map when a blob exists, `Ok(None)` when no
     /// blob has been written yet, and `Err` only when the backend is
     /// unavailable. Never calls `migrate_legacy_key`.
+    #[cfg(any(debug_assertions, test))]
     pub fn load_all_readonly(&self) -> Result<Option<HashMap<String, String>>, String> {
         #[cfg(feature = "system-keyring")]
         {
@@ -598,6 +599,7 @@ impl SecretStore {
     /// Entries that already exist in the blob are overwritten; entries not
     /// present in `entries` are left unchanged. If the resulting blob is
     /// identical to what is already stored, no keychain write occurs.
+    #[cfg(any(debug_assertions, test))]
     pub fn store_all(&self, entries: &HashMap<String, String>) -> Result<(), String> {
         #[cfg(feature = "system-keyring")]
         {

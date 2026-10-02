@@ -22,7 +22,13 @@ function withPane(
 ): WorkflowEditorTarget {
   return target.mode === "create"
     ? { initialChannelId: target.initialChannelId, mode: "create", pane }
-    : { mode: target.mode, pane, workflowId: target.workflowId };
+    : {
+        channelId: target.channelId,
+        mode: target.mode,
+        ownerPubkey: target.ownerPubkey,
+        pane,
+        workflowId: target.workflowId,
+      };
 }
 
 /**
@@ -47,13 +53,16 @@ export function AppWorkflowEditorOverlayProvider({
   );
   const [deleteTarget, setDeleteTarget] = React.useState<Workflow | null>(null);
 
-  const handleOpenWorkflow = React.useCallback(
-    (workflowId: string, workflow?: Workflow) => {
-      setWorkflowHint(workflow);
-      setEditor({ mode: "detail", pane: INITIAL_PANE, workflowId });
-    },
-    [],
-  );
+  const handleOpenWorkflow = React.useCallback((workflow: Workflow) => {
+    setWorkflowHint(workflow);
+    setEditor({
+      channelId: workflow.channelId,
+      mode: "detail",
+      ownerPubkey: workflow.ownerPubkey,
+      pane: INITIAL_PANE,
+      workflowId: workflow.id,
+    });
+  }, []);
 
   const handleOpenNewWorkflow = React.useCallback((channelId?: string) => {
     setWorkflowHint(undefined);
@@ -87,12 +96,24 @@ export function AppWorkflowEditorOverlayProvider({
     [],
   );
 
-  const handleEditWorkflow = React.useCallback((workflowId: string) => {
-    setEditor({ mode: "edit", pane: INITIAL_PANE, workflowId });
+  const handleEditWorkflow = React.useCallback((workflow: Workflow) => {
+    setEditor({
+      channelId: workflow.channelId,
+      mode: "edit",
+      ownerPubkey: workflow.ownerPubkey,
+      pane: INITIAL_PANE,
+      workflowId: workflow.id,
+    });
   }, []);
 
-  const handleDuplicateWorkflow = React.useCallback((workflowId: string) => {
-    setEditor({ mode: "duplicate", pane: INITIAL_PANE, workflowId });
+  const handleDuplicateWorkflow = React.useCallback((workflow: Workflow) => {
+    setEditor({
+      channelId: workflow.channelId,
+      mode: "duplicate",
+      ownerPubkey: workflow.ownerPubkey,
+      pane: INITIAL_PANE,
+      workflowId: workflow.id,
+    });
   }, []);
 
   const triggerMutation = useMutation({
@@ -105,7 +126,7 @@ export function AppWorkflowEditorOverlayProvider({
   });
 
   const deleteMutation = useMutation({
-    mutationFn: (workflowId: string) => deleteWorkflow(workflowId),
+    mutationFn: (workflow: Workflow) => deleteWorkflow(workflow),
     onSuccess: () => {
       void queryClient.invalidateQueries({
         predicate: (query) =>
@@ -125,7 +146,7 @@ export function AppWorkflowEditorOverlayProvider({
   const handleConfirmDelete = React.useCallback(
     async (workflow: Workflow) => {
       try {
-        await deleteOne(workflow.id);
+        await deleteOne(workflow);
         setDeleteTarget(null);
         closeEditor();
       } catch {
