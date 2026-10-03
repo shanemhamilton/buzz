@@ -21,8 +21,14 @@ pub const OBSERVER_FRAME_CONTROL: &str = "control";
 pub const NIP44_MIN_CONTENT_LEN: usize = 132;
 /// Maximum NIP-44 v2 ciphertext length.
 pub const NIP44_MAX_CONTENT_LEN: usize = 87_472;
-/// Maximum observer plaintext JSON size accepted by helpers.
+/// Maximum observer plaintext JSON size accepted when decrypting existing frames.
 pub const OBSERVER_MAX_PLAINTEXT_LEN: usize = 65_535;
+/// Maximum observer plaintext JSON size NIP-44 v2 can encrypt for outbound frames.
+///
+/// `nostr` 0.44.7 keeps its `MAX_SUPPORTED_PLAINTEXT_SIZE` limit private at
+/// this value. Keep the receive limit above separate so readers retain
+/// compatibility with the existing 65,535-byte observer frame envelope.
+pub const OBSERVER_MAX_OUTBOUND_PLAINTEXT_LEN: usize = 65_536 - 128;
 
 /// Errors returned by observer payload encryption/decryption helpers.
 #[derive(Debug, Error)]
@@ -39,7 +45,7 @@ pub enum ObserverPayloadError {
     /// Decrypted JSON exceeded the observer plaintext size limit.
     #[error("observer plaintext exceeds {max} bytes (got {got})")]
     PlaintextTooLarge {
-        /// Maximum accepted plaintext bytes.
+        /// Maximum plaintext bytes allowed for this operation.
         max: usize,
         /// Actual plaintext byte count.
         got: usize,
@@ -61,11 +67,11 @@ pub fn encrypt_observer_payload<T: Serialize>(
     payload: &T,
 ) -> Result<String, ObserverPayloadError> {
     let mut plaintext = serde_json::to_string(payload)?;
-    if plaintext.len() > OBSERVER_MAX_PLAINTEXT_LEN {
+    if plaintext.len() > OBSERVER_MAX_OUTBOUND_PLAINTEXT_LEN {
         let got = plaintext.len();
         plaintext.zeroize();
         return Err(ObserverPayloadError::PlaintextTooLarge {
-            max: OBSERVER_MAX_PLAINTEXT_LEN,
+            max: OBSERVER_MAX_OUTBOUND_PLAINTEXT_LEN,
             got,
         });
     }
@@ -137,6 +143,58 @@ mod tests {
         let decrypted: serde_json::Value =
             decrypt_observer_payload(&recipient, &event).expect("decrypt payload");
         assert_eq!(decrypted, payload);
+    }
+
+    #[test]
+    fn observer_payload_encrypts_at_nip44_v2_outbound_boundary() {
+        let sender = Keys::generate();
+        let recipient = Keys::generate();
+        let payload = "x".repeat(OBSERVER_MAX_OUTBOUND_PLAINTEXT_LEN - 2);
+        assert_eq!(
+            serde_json::to_string(&payload)
+                .expect("serialize payload")
+                .len(),
+            OBSERVER_MAX_OUTBOUND_PLAINTEXT_LEN,
+            "the JSON payload must exactly reach the NIP-44 v2 outbound budget"
+        );
+
+        let encrypted = encrypt_observer_payload(&sender, &recipient.public_key(), &payload)
+            .expect("encrypt at the NIP-44 v2 outbound budget");
+        let event = EventBuilder::new(
+            Kind::Custom(crate::kind::KIND_AGENT_OBSERVER_FRAME as u16),
+            encrypted,
+        )
+        .tags([Tag::public_key(recipient.public_key())])
+        .sign_with_keys(&sender)
+        .expect("sign event");
+        let decrypted: String =
+            decrypt_observer_payload(&recipient, &event).expect("decrypt boundary payload");
+        assert_eq!(decrypted, payload);
+    }
+
+    #[test]
+    fn observer_payload_rejects_plaintext_in_the_legacy_outbound_gap() {
+        let sender = Keys::generate();
+        let recipient = Keys::generate();
+
+        for serialized_len in [
+            OBSERVER_MAX_OUTBOUND_PLAINTEXT_LEN + 1,
+            OBSERVER_MAX_PLAINTEXT_LEN,
+        ] {
+            let payload = "x".repeat(serialized_len - 2);
+            assert_eq!(
+                serde_json::to_string(&payload)
+                    .expect("serialize payload")
+                    .len(),
+                serialized_len
+            );
+
+            assert!(matches!(
+                encrypt_observer_payload(&sender, &recipient.public_key(), &payload),
+                Err(ObserverPayloadError::PlaintextTooLarge { max, got })
+                    if max == OBSERVER_MAX_OUTBOUND_PLAINTEXT_LEN && got == serialized_len
+            ));
+        }
     }
 
     #[test]
