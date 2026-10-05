@@ -33,6 +33,7 @@ jobs:
           cargo fmt --all -- --check
           cargo test -p buzz-acp rest_ -- --test-threads=1
           cargo test -p buzz-acp thread_summary -- --test-threads=1
+          cargo test -p buzz-acp normal_listener_ephemeral_events_are_excluded_before_replay_state -- --test-threads=1
           cargo test -p buzz-acp verified_channel_event_is_recorded_and_forwarded -- --test-threads=1
           cargo clippy -p buzz-acp --all-targets -- -D warnings
       - name: Build the ACP repair candidate

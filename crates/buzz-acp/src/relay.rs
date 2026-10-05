@@ -117,8 +117,8 @@ const GATED_OBSERVER_QUEUE_CAP: usize = 256;
 use std::time::Instant;
 
 use buzz_core::kind::{
-    KIND_AGENT_OBSERVER_FRAME, KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION,
-    KIND_THREAD_SUMMARY, KIND_TYPING_INDICATOR,
+    is_ephemeral, KIND_AGENT_OBSERVER_FRAME, KIND_MEMBER_ADDED_NOTIFICATION,
+    KIND_MEMBER_REMOVED_NOTIFICATION, KIND_THREAD_SUMMARY, KIND_TYPING_INDICATOR,
 };
 use futures_util::{SinkExt, StreamExt};
 use nostr::{Event, EventBuilder, Keys, Kind, RelayUrl, Tag};
@@ -2225,14 +2225,29 @@ async fn handle_ws_message(
                             Err(mpsc::error::TrySendError::Closed(_)) => return false,
                         }
                     } else if let Some(channel_id) = channel_id_from_sub_id(&subscription_id) {
+                        let event_kind = u32::from(event.kind.as_u16());
                         // Thread summaries are relay-synthesized, fan-out-only
                         // overlays. They are never persisted, so they must not
                         // enter replay cursors, deduplication, or the harness.
-                        if u32::from(event.kind.as_u16()) == KIND_THREAD_SUMMARY {
+                        if event_kind == KIND_THREAD_SUMMARY {
                             debug!(
                                 channel_id = %channel_id,
+                                event_kind,
                                 event_id = %event.id,
                                 "dropping fan-out-only thread summary overlay"
+                            );
+                            return true;
+                        }
+                        // Ephemeral channel events (such as typing indicators)
+                        // are also never stored. A wildcard subscription can
+                        // receive them, but normal-listener lifecycle reactions
+                        // require a persistent target.
+                        if is_ephemeral(event_kind) {
+                            debug!(
+                                channel_id = %channel_id,
+                                event_kind,
+                                event_id = %event.id,
+                                "dropping ephemeral event from normal channel ingress"
                             );
                             return true;
                         }
@@ -4121,6 +4136,7 @@ mod recovery_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use buzz_core::kind::{EPHEMERAL_KIND_MAX, EPHEMERAL_KIND_MIN};
 
     async fn nip11_test_client(
         responses: HashMap<String, (u16, String)>,
@@ -4825,6 +4841,78 @@ mod tests {
             .expect("event channel should not contain shutdown marker");
         assert_eq!(forwarded.event.id, message.id);
         assert_eq!(state.last_seen.get(&channel_id), Some(&2_001));
+        assert!(state.seen_ids.contains(&message.id.to_hex()));
+    }
+
+    #[tokio::test]
+    async fn normal_listener_ephemeral_events_are_excluded_before_replay_state() {
+        let (mut client, _server) = test_ws_pair().await;
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let (observer_control_tx, _observer_control_rx) = mpsc::channel(4);
+        let mut state = BgState::new();
+        let channel_id = Uuid::new_v4();
+        let channel_tag = channel_id.to_string();
+        let ephemeral_events = [
+            (KIND_TYPING_INDICATOR, "typing", 2_000),
+            (EPHEMERAL_KIND_MIN, "ephemeral lower boundary", 2_001),
+            (EPHEMERAL_KIND_MAX, "ephemeral upper boundary", 2_002),
+        ]
+        .into_iter()
+        .map(|(kind, content, created_at)| {
+            EventBuilder::new(Kind::Custom(kind as u16), content)
+                .tags([Tag::parse(["h", channel_tag.as_str()]).expect("channel tag")])
+                .custom_created_at(nostr::Timestamp::from(created_at))
+                .sign_with_keys(&Keys::generate())
+                .expect("sign ephemeral channel event")
+        })
+        .collect::<Vec<_>>();
+
+        for event in &ephemeral_events {
+            for _ in 0..2 {
+                assert!(
+                    handle_test_relay_event(
+                        &mut client,
+                        &event_tx,
+                        &observer_control_tx,
+                        &mut state,
+                        &channel_sub_id(channel_id),
+                        event,
+                    )
+                    .await
+                );
+            }
+            assert!(matches!(
+                event_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            assert!(
+                !state.last_seen.contains_key(&channel_id),
+                "ephemeral timestamps must not advance replay cursors"
+            );
+            assert!(
+                !state.seen_ids.contains(&event.id.to_hex()),
+                "ephemeral IDs must not enter channel deduplication"
+            );
+        }
+
+        let message = make_signed_channel_event(&Keys::generate(), "hello", 2_003);
+        assert!(
+            handle_test_relay_event(
+                &mut client,
+                &event_tx,
+                &observer_control_tx,
+                &mut state,
+                &channel_sub_id(channel_id),
+                &message,
+            )
+            .await
+        );
+        let forwarded = event_rx
+            .try_recv()
+            .expect("ordinary channel event was forwarded")
+            .expect("event channel should not contain shutdown marker");
+        assert_eq!(forwarded.event.id, message.id);
+        assert_eq!(state.last_seen.get(&channel_id), Some(&2_003));
         assert!(state.seen_ids.contains(&message.id.to_hex()));
     }
 
