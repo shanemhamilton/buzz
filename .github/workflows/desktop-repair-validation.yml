@@ -14,7 +14,7 @@ concurrency:
 jobs:
   agent-http-retry:
     # Produce a source-identified local ACP repair candidate without publishing.
-    if: github.repository == 'shanemhamilton/buzz' && github.head_ref == 'fix/agent-http-rate-limit'
+    if: github.repository == 'shanemhamilton/buzz' && (github.head_ref == 'fix/agent-http-rate-limit' || github.head_ref == 'fix/acp-thread-summary-admission')
     runs-on: macos-latest
     timeout-minutes: 45
     env:
@@ -28,10 +28,12 @@ jobs:
           persist-credentials: false
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
-      - name: Validate ACP formatting and retry regressions
+      - name: Validate ACP formatting and runtime regressions
         run: |
           cargo fmt --all -- --check
           cargo test -p buzz-acp rest_ -- --test-threads=1
+          cargo test -p buzz-acp thread_summary -- --test-threads=1
+          cargo test -p buzz-acp verified_channel_event_is_recorded_and_forwarded -- --test-threads=1
           cargo clippy -p buzz-acp --all-targets -- -D warnings
       - name: Build the ACP repair candidate
         run: |
@@ -40,7 +42,7 @@ jobs:
           shasum -a 256 "target/$TARGET/release/buzz-acp" > target/buzz-acp.sha256
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: buzz-acp-http-retry-${{ github.event.pull_request.head.sha }}
+          name: buzz-acp-runtime-repair-${{ github.event.pull_request.head.sha }}
           path: |
             target/aarch64-apple-darwin/release/buzz-acp
             target/source-commit.txt
