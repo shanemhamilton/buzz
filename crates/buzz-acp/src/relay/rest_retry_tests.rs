@@ -199,8 +199,8 @@ async fn rest_query_flight_is_scoped_to_identity_and_filter() {
     second.expect("second identity query");
     assert_eq!(requests.load(Ordering::SeqCst), 2);
 
-    let filter = nostr::Filter::new().limit(1);
-    let (first, second) = tokio::join!(client.query(&[]), client.query(&[filter]));
+    let filters = [nostr::Filter::new().limit(1)];
+    let (first, second) = tokio::join!(client.query(&[]), client.query(&filters));
     first.expect("empty filter query");
     second.expect("limited filter query");
     assert_eq!(requests.load(Ordering::SeqCst), 4);
