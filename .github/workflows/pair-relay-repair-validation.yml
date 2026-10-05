@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - "crates/buzz-pair-relay/**"
+      - "Dockerfile.pair-relay"
       - ".github/workflows/pair-relay-repair-validation.yml"
   workflow_dispatch:
 
@@ -40,6 +41,108 @@ jobs:
           cargo build --locked --release -p buzz-pair-relay
           git rev-parse HEAD > target/source-commit.txt
           sha256sum target/release/buzz-pair-relay > target/buzz-pair-relay.sha256
+      - name: Build and smoke-test the pair relay image
+        run: |
+          set -euo pipefail
+          docker build \
+            --file Dockerfile.pair-relay \
+            --build-arg VERSION=0.1.1 \
+            --build-arg SOURCE_COMMIT="$(git rev-parse HEAD)" \
+            --tag buzz-pair-relay:ci \
+            .
+          docker run --detach --rm --name pair-relay-smoke --publish 127.0.0.1::5000 buzz-pair-relay:ci
+          port="$(docker port pair-relay-smoke 5000/tcp | sed -n 's/.*:\([0-9][0-9]*\)$/\1/p')"
+          test -n "$port"
+          PAIR_RELAY_PORT="$port" python3 - <<'PY'
+          import base64
+          import hashlib
+          import os
+          import socket
+          import time
+
+          host = "127.0.0.1"
+          port = int(os.environ["PAIR_RELAY_PORT"])
+          deadline = time.monotonic() + 20
+          max_response_bytes = 16 * 1024
+
+          def connect():
+              while True:
+                  try:
+                      return socket.create_connection((host, port), timeout=2)
+                  except OSError as error:
+                      if time.monotonic() >= deadline:
+                          raise SystemExit(f"pair relay did not accept connections: {error}") from error
+                      time.sleep(0.1)
+
+          def receive_headers(connection):
+              response = b""
+              while b"\r\n\r\n" not in response:
+                  chunk = connection.recv(4096)
+                  if not chunk:
+                      raise SystemExit("connection closed before response headers")
+                  if len(response) + len(chunk) > max_response_bytes:
+                      raise SystemExit("response headers exceed 16 KiB")
+                  response += chunk
+              return response
+
+          with connect() as health:
+              health.sendall(
+                  b"GET /health HTTP/1.1\r\n"
+                  b"Host: 127.0.0.1\r\n"
+                  b"Connection: close\r\n\r\n"
+              )
+              response = receive_headers(health)
+              headers, body = response.split(b"\r\n\r\n", 1)
+              while True:
+                  chunk = health.recv(4096)
+                  if not chunk:
+                      break
+                  if len(body) + len(chunk) > max_response_bytes:
+                      raise SystemExit("health response exceeds 16 KiB")
+                  body += chunk
+              if not headers.startswith(b"HTTP/1.1 200") or body != b"ok":
+                  raise SystemExit(f"unexpected health response: {response!r}")
+
+          key = base64.b64encode(os.urandom(16)).decode("ascii")
+          expected_accept = base64.b64encode(
+              hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
+          ).decode("ascii")
+          with connect() as websocket:
+              websocket.sendall(
+                  (
+                      "GET / HTTP/1.1\r\n"
+                      "Host: 127.0.0.1\r\n"
+                      "Connection: Upgrade\r\n"
+                      "Upgrade: websocket\r\n"
+                      f"Sec-WebSocket-Key: {key}\r\n"
+                      "Sec-WebSocket-Version: 13\r\n\r\n"
+                  ).encode("ascii")
+              )
+              headers = receive_headers(websocket).split(b"\r\n\r\n", 1)[0].decode("ascii")
+              fields = {}
+              for line in headers.split("\r\n")[1:]:
+                  name, value = line.split(":", 1)
+                  fields[name.lower()] = value.strip()
+              if (
+                  not headers.startswith("HTTP/1.1 101")
+                  or fields.get("upgrade", "").lower() != "websocket"
+                  or "upgrade" not in fields.get("connection", "").lower()
+                  or fields.get("sec-websocket-accept") != expected_accept
+              ):
+                  raise SystemExit(f"unexpected WebSocket handshake: {headers!r}")
+          PY
+      - name: Show pair relay logs on smoke-test failure
+        if: failure()
+        run: |
+          if docker container inspect pair-relay-smoke >/dev/null 2>&1; then
+            docker logs pair-relay-smoke
+          fi
+      - name: Remove the pair relay smoke-test container
+        if: always()
+        run: |
+          if docker container inspect pair-relay-smoke >/dev/null 2>&1; then
+            docker rm --force pair-relay-smoke
+          fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: buzz-pair-relay-${{ github.event.pull_request.head.sha || github.sha }}
