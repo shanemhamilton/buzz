@@ -1,0 +1,51 @@
+name: Pair Relay Repair Validation
+
+on:
+  pull_request:
+    paths:
+      - "crates/buzz-pair-relay/**"
+      - ".github/workflows/pair-relay-repair-validation.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pair-relay-repair-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    if: github.repository == 'shanemhamilton/buzz'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: 2
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - name: Validate pairing relay
+        run: |
+          set -euo pipefail
+          cargo fmt -p buzz-pair-relay -- --check
+          cargo test --locked -p buzz-pair-relay
+          cargo clippy --locked -p buzz-pair-relay --all-targets -- -D warnings
+      - name: Build an unpublished candidate
+        run: |
+          set -euo pipefail
+          cargo build --locked --release -p buzz-pair-relay
+          git rev-parse HEAD > target/source-commit.txt
+          sha256sum target/release/buzz-pair-relay > target/buzz-pair-relay.sha256
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: buzz-pair-relay-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            target/release/buzz-pair-relay
+            target/source-commit.txt
+            target/buzz-pair-relay.sha256
+          if-no-files-found: error
+          retention-days: 7

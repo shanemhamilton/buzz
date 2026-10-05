@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
 use buzz_pair_relay::{run_server, Relay};
@@ -39,6 +40,80 @@ async fn start_relay() -> String {
     format!("ws://127.0.0.1:{}", addr.port())
 }
 
+struct HttpResponse {
+    status: u16,
+    headers: String,
+    body: Vec<u8>,
+}
+
+/// Send a raw HTTP/1.1 request to the relay and read its complete response.
+/// This keeps the tests on the production Hyper service without another HTTP
+/// client dependency.
+async fn http_request(url: &str, method: &str, path: &str) -> HttpResponse {
+    let addr = url.strip_prefix("ws://").expect("relay URL must use ws://");
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let request = format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut response = Vec::new();
+    let header_end = loop {
+        let mut chunk = [0u8; 1024];
+        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut chunk))
+            .await
+            .expect("timed out reading HTTP response")
+            .unwrap();
+        if n == 0 {
+            panic!("relay closed before sending HTTP headers");
+        }
+        response.extend_from_slice(&chunk[..n]);
+        assert!(
+            response.len() <= 16 * 1024,
+            "HTTP response exceeded test bound"
+        );
+        if let Some(end) = response.windows(4).position(|window| window == b"\r\n\r\n") {
+            break end + 4;
+        }
+    };
+
+    let headers = String::from_utf8(response[..header_end].to_vec()).unwrap();
+    let content_length = headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().unwrap())
+    });
+
+    if let Some(content_length) = content_length {
+        while response.len() < header_end + content_length {
+            let mut chunk = [0u8; 1024];
+            let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut chunk))
+                .await
+                .expect("timed out reading HTTP response body")
+                .unwrap();
+            if n == 0 {
+                panic!("relay closed before sending the complete HTTP body");
+            }
+            response.extend_from_slice(&chunk[..n]);
+            assert!(
+                response.len() <= 16 * 1024,
+                "HTTP response exceeded test bound"
+            );
+        }
+        response.truncate(header_end + content_length);
+    }
+
+    let status = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|value| value.parse::<u16>().ok())
+        .expect("HTTP response is missing a status code");
+    HttpResponse {
+        status,
+        headers,
+        body: response[header_end..].to_vec(),
+    }
+}
+
 /// Connect a WebSocket client to the relay.
 async fn connect(url: &str) -> WS {
     let (ws, _) = connect_async(url).await.unwrap();
@@ -64,6 +139,45 @@ async fn recv(ws: &mut WS) -> Value {
         Message::Text(t) => serde_json::from_str(t.as_str()).expect("invalid JSON"),
         other => panic!("expected Text frame, got {:?}", other),
     }
+}
+
+/// 1. GET /health is a static plain-text response, and remains available when
+/// all WebSocket connection slots are occupied.
+#[tokio::test]
+async fn test_health_endpoint() {
+    let url = start_relay().await;
+
+    let mut conns: Vec<WS> = Vec::with_capacity(128);
+    for _ in 0..128 {
+        conns.push(connect(&url).await);
+    }
+
+    let response = http_request(&url, "GET", "/health").await;
+    assert_eq!(response.status, 200);
+    assert!(response
+        .headers
+        .lines()
+        .any(|line| { line.eq_ignore_ascii_case("content-type: text/plain") }));
+    assert_eq!(response.body.as_slice(), b"ok");
+}
+
+/// 2. Other methods and paths keep the existing bad-request behavior.
+#[tokio::test]
+async fn test_health_endpoint_rejects_invalid_method_and_path() {
+    let url = start_relay().await;
+
+    assert_eq!(http_request(&url, "POST", "/health").await.status, 400);
+    assert_eq!(http_request(&url, "GET", "/unknown").await.status, 400);
+}
+
+/// 3. The health response does not interfere with the WebSocket handshake.
+#[tokio::test]
+async fn test_websocket_upgrade_still_works_after_health_request() {
+    let url = start_relay().await;
+    assert_eq!(http_request(&url, "GET", "/health").await.status, 200);
+
+    let mut ws = connect(&url).await;
+    subscribe(&mut ws, "health-check", P_A).await;
 }
 
 /// Try to receive the next frame; return None if nothing arrives within 500 ms.
