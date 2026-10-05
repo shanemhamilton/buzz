@@ -256,18 +256,10 @@ pub struct RestClient {
     pub auth_tag_json: Option<String>,
 }
 
-/// Whether an HTTP status code is retriable (transient server/rate-limit errors).
-fn is_retriable_status(status: reqwest::StatusCode) -> bool {
-    matches!(status.as_u16(), 429 | 502 | 503 | 504)
-}
+mod http_retry;
 
-/// Base retry delays for transient HTTP failures: 500ms, 1s, 2s.
-/// Jitter (±20%) is applied at call time via `jittered_duration`.
-const REST_RETRY_BASE_DELAYS: [Duration; 3] = [
-    Duration::from_millis(500),
-    Duration::from_millis(1000),
-    Duration::from_millis(2000),
-];
+#[cfg(test)]
+mod rest_retry_tests;
 
 fn unix_now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -394,63 +386,6 @@ impl RestClient {
         Ok(format!("Nostr {}", self.sign_nip98(method, url, body)?))
     }
 
-    /// Retry helper: executes `build_request` up to 4 times (1 attempt + 3 retries)
-    /// on transient failures (429, 502, 503, 504, timeout, connect errors).
-    ///
-    /// NIP-98 auth events are re-signed on each attempt (they have a ±60s window).
-    async fn request_with_retry<F, Fut>(
-        &self,
-        method: &str,
-        path: &str,
-        build_request: F,
-    ) -> Result<reqwest::Response, RelayError>
-    where
-        F: Fn() -> Fut,
-        Fut: std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
-    {
-        let mut last_err = None;
-
-        for (attempt, delay) in std::iter::once(None)
-            .chain(REST_RETRY_BASE_DELAYS.iter().map(|d| Some(*d)))
-            .enumerate()
-        {
-            if let Some(base) = delay {
-                let jittered = jittered_duration(base);
-                tracing::debug!(
-                    "retrying {method} {path} (attempt {attempt}) in {:.1}s",
-                    jittered.as_secs_f64()
-                );
-                tokio::time::sleep(jittered).await;
-            }
-
-            match build_request().await {
-                Ok(resp) if resp.status().is_success() => return Ok(resp),
-                Ok(resp) if is_retriable_status(resp.status()) => {
-                    let status = resp.status();
-                    tracing::warn!("{method} {path} returned retriable HTTP {status}");
-                    last_err = Some(RelayError::Http(format!(
-                        "{method} {path} returned HTTP {status}"
-                    )));
-                }
-                Ok(resp) => {
-                    return Err(RelayError::Http(format!(
-                        "{method} {} returned HTTP {}",
-                        path,
-                        resp.status()
-                    )));
-                }
-                Err(e) if e.is_timeout() || e.is_connect() => {
-                    tracing::warn!("{method} {path} network error: {e}");
-                    last_err = Some(RelayError::Http(e.to_string()));
-                }
-                Err(e) => return Err(RelayError::Http(e.to_string())),
-            }
-        }
-
-        Err(last_err
-            .unwrap_or_else(|| RelayError::Http(format!("{method} {path} failed after retries"))))
-    }
-
     /// POST with NIP-98 auth and retry. Re-signs on each attempt.
     async fn bridge_post(
         &self,
@@ -486,10 +421,7 @@ impl RestClient {
     pub async fn query(&self, filters: &[nostr::Filter]) -> Result<Value, RelayError> {
         let body_bytes = serde_json::to_vec(filters)
             .map_err(|e| RelayError::Http(format!("filter serialize error: {e}")))?;
-        let resp = self.bridge_post("/query", &body_bytes).await?;
-        resp.json()
-            .await
-            .map_err(|e| RelayError::Http(e.to_string()))
+        self.query_json(body_bytes).await
     }
 
     /// Query events via `POST /query` with a raw NIP-01 filter document.
@@ -499,10 +431,7 @@ impl RestClient {
     pub async fn query_raw(&self, filters: &[Value]) -> Result<Value, RelayError> {
         let body_bytes = serde_json::to_vec(filters)
             .map_err(|e| RelayError::Http(format!("filter serialize error: {e}")))?;
-        let resp = self.bridge_post("/query", &body_bytes).await?;
-        resp.json()
-            .await
-            .map_err(|e| RelayError::Http(e.to_string()))
+        self.query_json(body_bytes).await
     }
 
     /// Query every historical event matching one raw filter across bounded pages.
