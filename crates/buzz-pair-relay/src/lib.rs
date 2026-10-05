@@ -34,8 +34,8 @@ use futures_util::{SinkExt, StreamExt};
 use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{
-    HeaderValue, CONNECTION, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION,
-    UPGRADE,
+    HeaderValue, CONNECTION, CONTENT_TYPE, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY,
+    SEC_WEBSOCKET_VERSION, UPGRADE,
 };
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -914,6 +914,14 @@ async fn http_service(
     relay: Arc<Relay>,
     mut req: Request<Incoming>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    if req.method() == Method::GET && req.uri().path() == "/health" {
+        let mut response = Response::new(Full::new(Bytes::from_static(b"ok")));
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+        return Ok(response);
+    }
+
     let headers = req.headers();
     let key = headers.get(SEC_WEBSOCKET_KEY).cloned();
     let is_ws = req.method() == Method::GET

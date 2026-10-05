@@ -1,0 +1,38 @@
+# syntax=docker/dockerfile:1.7
+#
+# Ephemeral pairing-relay sidecar. This intentionally builds only the pairing
+# relay, avoiding the primary relay's web bundle and unrelated workspace bins.
+
+ARG RUST_VERSION=1.95
+ARG DEBIAN_VERSION=bookworm
+ARG VERSION=0.1.1
+ARG SOURCE_COMMIT=unknown
+ARG RAILWAY_GIT_COMMIT_SHA=
+
+FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS builder
+WORKDIR /build
+COPY . .
+RUN cargo build --locked --release -p buzz-pair-relay
+
+FROM debian:${DEBIAN_VERSION}-slim AS runtime
+ARG VERSION
+ARG SOURCE_COMMIT
+ARG RAILWAY_GIT_COMMIT_SHA
+LABEL org.opencontainers.image.title="Buzz Pair Relay" \
+      org.opencontainers.image.description="Ephemeral sidecar relay for NIP-AB device pairing handshakes" \
+      org.opencontainers.image.source="https://github.com/shanemhamilton/buzz" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${RAILWAY_GIT_COMMIT_SHA:-${SOURCE_COMMIT}}"
+
+RUN groupadd --system --gid 1000 buzz \
+    && useradd --system --uid 1000 --gid 1000 --home-dir /var/lib/buzz \
+        --create-home --shell /usr/sbin/nologin buzz
+
+COPY --from=builder /build/target/release/buzz-pair-relay /usr/local/bin/buzz-pair-relay
+
+ENV BUZZ_PAIR_RELAY_BIND_ADDR=0.0.0.0:5000
+EXPOSE 5000
+USER buzz:buzz
+WORKDIR /var/lib/buzz
+CMD ["/usr/local/bin/buzz-pair-relay"]

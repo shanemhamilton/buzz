@@ -6,6 +6,16 @@
 
 - Follow or unfollow delivered channel messages before their first reply.
 
+## Pairing relay 0.1.1 - 2026-10-05
+
+### Fixed
+
+- Return HTTP 200 from `GET /health` without reserving a WebSocket connection slot, so deployment readiness checks succeed even at connection capacity.
+
+### Changed
+
+- Build the pairing relay independently in a non-root container and pin production deployments to the tested source commit.
+
 ## v0.5.26
 
 ### Desktop and shared changes
