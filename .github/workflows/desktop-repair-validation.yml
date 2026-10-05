@@ -12,6 +12,42 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  agent-http-retry:
+    # Produce a source-identified local ACP repair candidate without publishing.
+    if: github.repository == 'shanemhamilton/buzz' && github.head_ref == 'fix/agent-http-rate-limit'
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_BUILD_JOBS: 2
+      TARGET: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+      - name: Validate ACP formatting and retry regressions
+        run: |
+          cargo fmt --all -- --check
+          cargo test -p buzz-acp rest_ -- --test-threads=1
+          cargo clippy -p buzz-acp --all-targets -- -D warnings
+      - name: Build the ACP repair candidate
+        run: |
+          cargo build --release --target "$TARGET" -p buzz-acp
+          git rev-parse HEAD > target/source-commit.txt
+          shasum -a 256 "target/$TARGET/release/buzz-acp" > target/buzz-acp.sha256
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: buzz-acp-http-retry-${{ github.event.pull_request.head.sha }}
+          path: |
+            target/aarch64-apple-darwin/release/buzz-acp
+            target/source-commit.txt
+            target/buzz-acp.sha256
+          if-no-files-found: error
+          retention-days: 7
+
   observer-boundary-tests:
     # Read-only hosted validation for the observer encryption boundary repair.
     if: github.repository == 'shanemhamilton/buzz' && github.head_ref == 'fix/observer-encryption-budget'
