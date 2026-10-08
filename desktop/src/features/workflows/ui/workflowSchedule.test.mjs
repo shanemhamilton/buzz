@@ -4,17 +4,111 @@ import test from "node:test";
 import {
   defaultScheduleTrigger,
   isValidScheduleTimezone,
+  localScheduleTimezone,
   scheduleFormFromTrigger,
   scheduleTimezoneLabel,
+  scheduleTimezoneOptions,
   scheduleTriggerFromForm,
   scheduleWeekdaysFromCronField,
+  updateScheduleTrigger,
 } from "./workflowSchedule.ts";
 
-test("new schedules default to daily at 09:00 Central Time", () => {
-  assert.deepEqual(defaultScheduleTrigger(), {
-    on: "schedule",
-    cron: "0 9 * * *",
-    timezone: "America/Chicago",
+function withDateTimeFormat(replacement, callback) {
+  const original = Intl.DateTimeFormat;
+  Intl.DateTimeFormat = replacement;
+  try {
+    callback();
+  } finally {
+    Intl.DateTimeFormat = original;
+  }
+}
+
+function withResolvedTimezone(timezone, callback) {
+  const NativeDateTimeFormat = Intl.DateTimeFormat;
+  withDateTimeFormat(function DateTimeFormat(...args) {
+    if (args.length === 0) {
+      return { resolvedOptions: () => ({ timeZone: timezone }) };
+    }
+    return new NativeDateTimeFormat(...args);
+  }, callback);
+}
+
+test("new schedules resolve the computer timezone when they are created", () => {
+  for (const timezone of ["Europe/London", "America/Los_Angeles"]) {
+    withResolvedTimezone(timezone, () => {
+      assert.equal(localScheduleTimezone(), timezone);
+      assert.deepEqual(defaultScheduleTrigger(), {
+        on: "schedule",
+        cron: "0 9 * * *",
+        timezone,
+      });
+    });
+  }
+});
+
+test("new schedules use UTC for unavailable, invalid, or equivalent host zones", () => {
+  for (const timezone of [undefined, "", "Etc/UTC", "Not/AZone"]) {
+    withResolvedTimezone(timezone, () => {
+      assert.equal(localScheduleTimezone(), "UTC");
+      assert.equal(defaultScheduleTrigger().timezone, "UTC");
+    });
+  }
+
+  withDateTimeFormat(
+    function DateTimeFormat() {
+      throw new Error("timezone unavailable");
+    },
+    () => {
+      assert.equal(localScheduleTimezone(), "UTC");
+      assert.equal(defaultScheduleTrigger().timezone, "UTC");
+    },
+  );
+});
+
+test("timezone options include local, UTC, and imported zones once", () => {
+  withResolvedTimezone("Europe/London", () => {
+    assert.deepEqual(scheduleTimezoneOptions(undefined), [
+      "Europe/London",
+      "UTC",
+    ]);
+    assert.deepEqual(scheduleTimezoneOptions("Europe/London"), [
+      "Europe/London",
+      "UTC",
+    ]);
+    assert.deepEqual(scheduleTimezoneOptions("UTC"), ["Europe/London", "UTC"]);
+    assert.deepEqual(scheduleTimezoneOptions("America/Chicago"), [
+      "Europe/London",
+      "UTC",
+      "America/Chicago",
+    ]);
+  });
+});
+
+test("switching from elapsed intervals to cron uses local time without changing legacy cron edits", () => {
+  withResolvedTimezone("Europe/London", () => {
+    const daily = defaultScheduleTrigger();
+    const hourly = updateScheduleTrigger(scheduleFormFromTrigger(daily), {
+      frequency: "hourly",
+    });
+    assert.deepEqual(hourly, { on: "schedule", interval: "1h" });
+    const restored = updateScheduleTrigger(scheduleFormFromTrigger(hourly), {
+      frequency: "daily",
+    });
+    assert.equal(restored.timezone, "Europe/London");
+    const custom = updateScheduleTrigger(scheduleFormFromTrigger(hourly), {
+      frequency: "custom_cron",
+      customCron: "",
+    });
+    assert.equal(custom.timezone, "Europe/London");
+    const populated = updateScheduleTrigger(scheduleFormFromTrigger(custom), {
+      customCron: "0 8 * * *",
+    });
+    assert.equal(populated.timezone, "Europe/London");
+    const legacy = updateScheduleTrigger(
+      scheduleFormFromTrigger({ on: "schedule", cron: "0 9 * * *" }),
+      { time: "10:00" },
+    );
+    assert.deepEqual(legacy, { on: "schedule", cron: "0 10 * * *" });
   });
 });
 

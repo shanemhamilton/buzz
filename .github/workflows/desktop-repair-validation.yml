@@ -123,6 +123,7 @@ jobs:
           cargo test -p buzz-acp pending_nonretryable_notice_skips_removed_channel
           cargo test -p buzz-cli workflows::tests
           cargo test -p buzz-workflow
+          cargo test -p buzz-relay --lib nip11::tests
           cargo test -p buzz-agent --test fake_llm steer_rejected_on_empty_prompt
           cargo test -p buzz-acp session_resource
           cargo test -p buzz-acp cancelled_

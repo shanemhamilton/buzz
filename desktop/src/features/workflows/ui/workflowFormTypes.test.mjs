@@ -10,6 +10,7 @@ import {
   yamlToFormState,
   DEFAULT_FORM_STATE,
 } from "./workflowFormTypes.ts";
+import { defaultScheduleTrigger } from "./workflowSchedule.ts";
 
 function accepted(yaml) {
   const result = yamlToFormState(yaml);
@@ -179,10 +180,7 @@ test("cron timezone schema values survive YAML and legacy UTC stays absent", () 
     const yaml = `name: Zoned\ntrigger: { on: schedule, cron: "0 9 * * *", timezone: ${timezone} }\nsteps: [{ id: s1, action: send_message, text: hi }]\n`;
     const state = accepted(yaml);
     assert.equal(state.trigger.timezone, timezone);
-    assert.equal(
-      parseYaml(formStateToYaml(state)).trigger.timezone,
-      timezone,
-    );
+    assert.equal(parseYaml(formStateToYaml(state)).trigger.timezone, timezone);
   }
 
   const legacyYaml = `name: Legacy UTC\ntrigger: { on: schedule, cron: "0 9 * * *" }\nsteps: [{ id: s1, action: send_message, text: hi }]\n`;
@@ -224,23 +222,17 @@ test("the serializer emits only one schedule representation", () => {
   });
 });
 
-test("serializes a new daily schedule at 09:00 Central Time", () => {
+test("serializes a new daily schedule with its explicit local timezone", () => {
+  const trigger = defaultScheduleTrigger();
+  assert.equal(typeof trigger.timezone, "string");
   const yaml = formStateToYaml({
     name: "Daily",
     description: "",
     enabled: true,
-    trigger: {
-      on: "schedule",
-      cron: "0 9 * * *",
-      timezone: "America/Chicago",
-    },
+    trigger,
     steps: [{ id: "s1", action: "send_message", text: "hi" }],
   });
-  assert.deepEqual(parseYaml(yaml).trigger, {
-    on: "schedule",
-    cron: "0 9 * * *",
-    timezone: "America/Chicago",
-  });
+  assert.deepEqual(parseYaml(yaml).trigger, trigger);
 });
 
 test("presents step timeout seconds as durations and serializes them numerically", () => {

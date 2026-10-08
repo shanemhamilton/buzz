@@ -7,12 +7,13 @@ import { CronExpressionInput } from "./CronExpressionInput";
 import { FieldLabel, FormSelect } from "./workflowFormPrimitives";
 import type { TriggerConfig } from "./workflowFormTypes";
 import {
-  DEFAULT_SCHEDULE_TIMEZONE,
   SCHEDULE_FREQUENCIES,
   SCHEDULE_FREQUENCY_LABELS,
   scheduleFormFromTrigger,
   scheduleTimezoneLabel,
+  scheduleTimezoneOptions,
   scheduleTriggerFromForm,
+  updateScheduleTrigger,
   scheduleWeekdaysFromCronField,
 } from "./workflowSchedule";
 import type { ScheduleFormState } from "./workflowSchedule";
@@ -28,9 +29,11 @@ const WEEKDAYS = [
 ] as const;
 
 const MONTH_DAYS = Array.from({ length: 31 }, (_, index) => String(index + 1));
-const SCHEDULE_TIMEZONES = [DEFAULT_SCHEDULE_TIMEZONE, "UTC"];
 
-function timezoneOptionLabel(timezone: string): string {
+function timezoneOptionLabel(timezone: string, localTimezone: string): string {
+  if (timezone === localTimezone && timezone !== "UTC") {
+    return `Local time (${timezone})`;
+  }
   const label = scheduleTimezoneLabel(timezone);
   return label === timezone ? timezone : `${label} (${timezone})`;
 }
@@ -76,11 +79,13 @@ export function WorkflowScheduleFields({
       }
     : parsedSchedule;
   const updateSchedule = (updates: Partial<ScheduleFormState>) => {
-    onUpdate(scheduleTriggerFromForm({ ...schedule, ...updates }));
+    onUpdate(updateScheduleTrigger(schedule, updates));
   };
   const usesTime = ["daily", "weekly", "monthly"].includes(schedule.frequency);
   const usesTimezone = usesTime || schedule.frequency === "custom_cron";
   const selectedTimezone = schedule.timezone ?? "UTC";
+  const timezoneOptions = scheduleTimezoneOptions(schedule.timezone);
+  const localTimezone = timezoneOptions[0];
   const selectedWeekdays = new Set(
     scheduleWeekdaysFromCronField(schedule.weekday),
   );
@@ -230,17 +235,11 @@ export function WorkflowScheduleFields({
             onChange={(timezone) => updateSchedule({ timezone })}
             value={selectedTimezone}
           >
-            {SCHEDULE_TIMEZONES.map((timezone) => (
+            {timezoneOptions.map((timezone) => (
               <option key={timezone} value={timezone}>
-                {timezoneOptionLabel(timezone)}
+                {timezoneOptionLabel(timezone, localTimezone)}
               </option>
             ))}
-            {schedule.timezone &&
-            !SCHEDULE_TIMEZONES.includes(schedule.timezone) ? (
-              <option value={schedule.timezone}>
-                {timezoneOptionLabel(schedule.timezone)}
-              </option>
-            ) : null}
           </FormSelect>
           <p className="text-xs text-muted-foreground">
             Cron schedules follow this zone, including daylight saving changes.

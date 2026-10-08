@@ -48,15 +48,10 @@ const FREQUENCY_INTERVALS: Partial<Record<ScheduleFrequency, string>> = {
 const DEFAULT_TIME = "09:00";
 const DEFAULT_WEEKDAY = "1";
 const DEFAULT_MONTH_DAY = "1";
-
-export const DEFAULT_SCHEDULE_TIMEZONE = "America/Chicago";
+const FALLBACK_SCHEDULE_TIMEZONE = "UTC";
 
 export function isValidScheduleTimezone(timezone: string): boolean {
-  if (
-    !timezone ||
-    timezone.trim() !== timezone ||
-    /^[+-]/.test(timezone)
-  ) {
+  if (!timezone || timezone.trim() !== timezone || /^[+-]/.test(timezone)) {
     return false;
   }
 
@@ -68,9 +63,32 @@ export function isValidScheduleTimezone(timezone: string): boolean {
   }
 }
 
+export function localScheduleTimezone(): string {
+  try {
+    const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    if (typeof timezone !== "string" || !isValidScheduleTimezone(timezone)) {
+      return FALLBACK_SCHEDULE_TIMEZONE;
+    }
+    return timezone === "Etc/UTC" ? FALLBACK_SCHEDULE_TIMEZONE : timezone;
+  } catch {
+    return FALLBACK_SCHEDULE_TIMEZONE;
+  }
+}
+
+export function scheduleTimezoneOptions(
+  existingTimezone: string | undefined,
+): string[] {
+  const timezones = [
+    localScheduleTimezone(),
+    FALLBACK_SCHEDULE_TIMEZONE,
+    existingTimezone,
+  ].filter((timezone): timezone is string => timezone !== undefined);
+  return [...new Set(timezones)];
+}
+
 export function scheduleTimezoneLabel(timezone: string | undefined): string {
-  const effectiveTimezone = timezone ?? "UTC";
-  if (effectiveTimezone === DEFAULT_SCHEDULE_TIMEZONE) return "Central Time";
+  const effectiveTimezone = timezone ?? FALLBACK_SCHEDULE_TIMEZONE;
+  if (effectiveTimezone === "America/Chicago") return "Central Time";
   if (effectiveTimezone === "UTC" || effectiveTimezone === "Etc/UTC") {
     return "UTC";
   }
@@ -167,7 +185,10 @@ export function scheduleFormFromTrigger(
   };
 }
 
-function cronTrigger(cron: string, timezone: string | undefined): TriggerConfig {
+function cronTrigger(
+  cron: string,
+  timezone: string | undefined,
+): TriggerConfig {
   return {
     on: "schedule",
     cron,
@@ -221,7 +242,22 @@ export function defaultScheduleTrigger(): TriggerConfig {
   return scheduleTriggerFromForm(
     scheduleFormFromTrigger({
       on: "schedule",
-      timezone: DEFAULT_SCHEDULE_TIMEZONE,
+      timezone: localScheduleTimezone(),
     }),
   );
+}
+
+export function updateScheduleTrigger(
+  form: ScheduleFormState,
+  updates: Partial<ScheduleFormState>,
+): TriggerConfig {
+  const trigger = scheduleTriggerFromForm({ ...form, ...updates });
+  if (
+    updates.frequency !== undefined &&
+    scheduleTriggerFromForm(form).interval &&
+    trigger.cron !== undefined
+  ) {
+    return { ...trigger, timezone: localScheduleTimezone() };
+  }
+  return trigger;
 }
