@@ -10,13 +10,17 @@ use nostr::{EventBuilder, Keys, Kind, Tag};
 /// content and d/h tags.
 fn wf_event(d: &str, h: &str, yaml: &str) -> nostr::Event {
     let keys = Keys::generate();
+    wf_event_with_keys(&keys, d, h, yaml)
+}
+
+fn wf_event_with_keys(keys: &Keys, d: &str, h: &str, yaml: &str) -> nostr::Event {
     let tags: Vec<Tag> = [vec!["d", d], vec!["h", h]]
         .into_iter()
         .map(|t| Tag::parse(t).expect("parse tag"))
         .collect();
     EventBuilder::new(Kind::Custom(30620), yaml)
         .tags(tags)
-        .sign_with_keys(&keys)
+        .sign_with_keys(keys)
         .expect("sign")
 }
 
@@ -543,10 +547,12 @@ async fn update_timezone_workflow_does_not_publish_when_extension_is_absent() {
 
     let _serial = crate::relay_admission::TEST_SERIAL.lock().await;
     crate::relay_admission::reset_rate_limit_gate();
-    let prior = wf_event(WF, CHAN, YAML);
+    let state = crate::app_state::build_app_state();
+    let signing_keys = state.signing_keys().expect("signable test identity");
+    let prior = wf_event_with_keys(&signing_keys, WF, CHAN, YAML);
+    let owner_pubkey = prior.pubkey.to_hex();
     let prior_body = serde_json::to_string(&vec![prior.clone()]).unwrap();
     let (addr, server) = serve_workflow_update(prior_body, r#"{"supported_extensions":[]}"#).await;
-    let state = crate::app_state::build_app_state();
     *state.relay_url_override.lock().unwrap() = Some(format!("ws://{addr}"));
     let app = tauri::test::mock_builder()
         .manage(state)
@@ -555,6 +561,8 @@ async fn update_timezone_workflow_does_not_publish_when_extension_is_absent() {
 
     let error = update_workflow(
         WF.to_string(),
+        owner_pubkey.clone(),
+        Some(CHAN.to_string()),
         TIMEZONE_YAML.to_string(),
         prior.id.to_hex(),
         app.state(),
@@ -566,6 +574,8 @@ async fn update_timezone_workflow_does_not_publish_when_extension_is_absent() {
     let requests = server.await.unwrap();
     assert_eq!(requests.len(), 2, "no update event may be published");
     assert!(requests[0].starts_with("POST /query "), "{}", requests[0]);
+    assert!(requests[0].contains(&owner_pubkey), "{}", requests[0]);
+    assert!(requests[0].contains(CHAN), "{}", requests[0]);
     assert!(requests[1].starts_with("GET /info "), "{}", requests[1]);
     crate::relay_admission::reset_rate_limit_gate();
 }

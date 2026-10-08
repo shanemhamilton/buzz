@@ -74,14 +74,14 @@ jobs:
 
   validate-and-build:
     # This fork testing lane neither signs nor publishes a release.
-    if: github.repository == 'shanemhamilton/buzz' && (github.event_name == 'workflow_dispatch' || github.head_ref == 'fix/desktop-agent-workflow-repairs' || github.head_ref == 'upgrade/desktop-0.5.27-fork')
+    if: github.repository == 'shanemhamilton/buzz' && (github.event_name == 'workflow_dispatch' || github.head_ref == 'fix/desktop-agent-workflow-repairs' || github.head_ref == 'upgrade/desktop-0.5.27-fork' || github.head_ref == 'upgrade/desktop-0.5.27-reviewed')
     runs-on: macos-latest
     timeout-minutes: 90
     env:
       CARGO_TERM_COLOR: always
       CARGO_BUILD_JOBS: 2
       TARGET: aarch64-apple-darwin
-      UPGRADE_CANDIDATE: ${{ github.head_ref == 'upgrade/desktop-0.5.27-fork' || github.ref_name == 'upgrade/desktop-0.5.27-fork' }}
+      UPGRADE_CANDIDATE: ${{ github.head_ref == 'upgrade/desktop-0.5.27-fork' || github.ref_name == 'upgrade/desktop-0.5.27-fork' || github.head_ref == 'upgrade/desktop-0.5.27-reviewed' || github.ref_name == 'upgrade/desktop-0.5.27-reviewed' }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
