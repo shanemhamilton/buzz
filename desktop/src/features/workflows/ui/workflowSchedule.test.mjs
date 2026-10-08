@@ -3,15 +3,18 @@ import test from "node:test";
 
 import {
   defaultScheduleTrigger,
+  isValidScheduleTimezone,
   scheduleFormFromTrigger,
+  scheduleTimezoneLabel,
   scheduleTriggerFromForm,
   scheduleWeekdaysFromCronField,
 } from "./workflowSchedule.ts";
 
-test("new schedules default to daily at 09:00 UTC", () => {
+test("new schedules default to daily at 09:00 Central Time", () => {
   assert.deepEqual(defaultScheduleTrigger(), {
     on: "schedule",
     cron: "0 9 * * *",
+    timezone: "America/Chicago",
   });
 });
 
@@ -42,6 +45,21 @@ test("round-trips daily, weekly, monthly, and custom cron schedules", () => {
     const form = scheduleFormFromTrigger({ on: "schedule", cron });
     assert.deepEqual(scheduleTriggerFromForm(form), { on: "schedule", cron });
   }
+});
+
+test("round-trips explicit cron timezones without relabeling legacy UTC", () => {
+  for (const timezone of ["America/Chicago", "UTC", "Europe/London"]) {
+    const trigger = { on: "schedule", cron: "30 14 * * *", timezone };
+    assert.deepEqual(
+      scheduleTriggerFromForm(scheduleFormFromTrigger(trigger)),
+      trigger,
+    );
+  }
+
+  const legacyUtc = { on: "schedule", cron: "0 9 * * *" };
+  const legacyForm = scheduleFormFromTrigger(legacyUtc);
+  assert.equal(legacyForm.timezone, undefined);
+  assert.deepEqual(scheduleTriggerFromForm(legacyForm), legacyUtc);
 });
 
 test("preserves arbitrary custom cron and legacy interval strings exactly", () => {
@@ -86,4 +104,30 @@ test("switching schedule modes never emits cron and interval together", () => {
 
   assert.deepEqual(custom, { on: "schedule", cron: "0 8 * * 6" });
   assert.equal("interval" in custom, false);
+
+  const interval = scheduleTriggerFromForm({
+    ...scheduleFormFromTrigger({
+      on: "schedule",
+      cron: "0 9 * * *",
+      timezone: "America/Chicago",
+    }),
+    frequency: "hourly",
+  });
+  assert.deepEqual(interval, { on: "schedule", interval: "1h" });
+  assert.equal("timezone" in interval, false);
+});
+
+test("validates IANA timezones and labels effective cron zones", () => {
+  assert.equal(isValidScheduleTimezone("America/Chicago"), true);
+  assert.equal(isValidScheduleTimezone("UTC"), true);
+  assert.equal(isValidScheduleTimezone("Europe/London"), true);
+  assert.equal(isValidScheduleTimezone(""), false);
+  assert.equal(isValidScheduleTimezone(" America/Chicago"), false);
+  assert.equal(isValidScheduleTimezone("Not/AZone"), false);
+  assert.equal(isValidScheduleTimezone("+01:00"), false);
+
+  assert.equal(scheduleTimezoneLabel("America/Chicago"), "Central Time");
+  assert.equal(scheduleTimezoneLabel("UTC"), "UTC");
+  assert.equal(scheduleTimezoneLabel(undefined), "UTC");
+  assert.equal(scheduleTimezoneLabel("Europe/London"), "Europe/London");
 });

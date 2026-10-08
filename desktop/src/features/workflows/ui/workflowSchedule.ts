@@ -19,6 +19,7 @@ export type ScheduleFormState = {
   frequency: ScheduleFormFrequency;
   monthDay: string;
   time: string;
+  timezone?: string;
   weekday: string;
 };
 
@@ -47,6 +48,34 @@ const FREQUENCY_INTERVALS: Partial<Record<ScheduleFrequency, string>> = {
 const DEFAULT_TIME = "09:00";
 const DEFAULT_WEEKDAY = "1";
 const DEFAULT_MONTH_DAY = "1";
+
+export const DEFAULT_SCHEDULE_TIMEZONE = "America/Chicago";
+
+export function isValidScheduleTimezone(timezone: string): boolean {
+  if (
+    !timezone ||
+    timezone.trim() !== timezone ||
+    /^[+-]/.test(timezone)
+  ) {
+    return false;
+  }
+
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: timezone }).format(0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function scheduleTimezoneLabel(timezone: string | undefined): string {
+  const effectiveTimezone = timezone ?? "UTC";
+  if (effectiveTimezone === DEFAULT_SCHEDULE_TIMEZONE) return "Central Time";
+  if (effectiveTimezone === "UTC" || effectiveTimezone === "Etc/UTC") {
+    return "UTC";
+  }
+  return effectiveTimezone;
+}
 
 type ParsedCommonCron = {
   frequency: "daily" | "weekly" | "monthly";
@@ -120,6 +149,7 @@ export function scheduleFormFromTrigger(
       frequency: frequency ?? "custom_interval",
       monthDay: DEFAULT_MONTH_DAY,
       time: DEFAULT_TIME,
+      timezone: undefined,
       weekday: DEFAULT_WEEKDAY,
     };
   }
@@ -132,12 +162,17 @@ export function scheduleFormFromTrigger(
     frequency: commonCron?.frequency ?? (cron ? "custom_cron" : "daily"),
     monthDay: commonCron?.monthDay ?? DEFAULT_MONTH_DAY,
     time: commonCron?.time ?? DEFAULT_TIME,
+    timezone: trigger.timezone,
     weekday: commonCron?.weekday ?? DEFAULT_WEEKDAY,
   };
 }
 
-function cronTrigger(cron: string): TriggerConfig {
-  return { on: "schedule", cron };
+function cronTrigger(cron: string, timezone: string | undefined): TriggerConfig {
+  return {
+    on: "schedule",
+    cron,
+    ...(timezone === undefined ? {} : { timezone }),
+  };
 }
 
 function intervalTrigger(interval: string): TriggerConfig {
@@ -162,20 +197,31 @@ export function scheduleTriggerFromForm(
     return intervalTrigger(form.customInterval);
   }
   if (form.frequency === "custom_cron") {
-    return cronTrigger(form.customCron);
+    return cronTrigger(form.customCron, form.timezone);
   }
 
   const { hour, minute } = cronTime(form.time);
   switch (form.frequency) {
     case "weekly":
-      return cronTrigger(`${minute} ${hour} * * ${form.weekday}`);
+      return cronTrigger(
+        `${minute} ${hour} * * ${form.weekday}`,
+        form.timezone,
+      );
     case "monthly":
-      return cronTrigger(`${minute} ${hour} ${form.monthDay} * *`);
+      return cronTrigger(
+        `${minute} ${hour} ${form.monthDay} * *`,
+        form.timezone,
+      );
     default:
-      return cronTrigger(`${minute} ${hour} * * *`);
+      return cronTrigger(`${minute} ${hour} * * *`, form.timezone);
   }
 }
 
 export function defaultScheduleTrigger(): TriggerConfig {
-  return scheduleTriggerFromForm(scheduleFormFromTrigger({ on: "schedule" }));
+  return scheduleTriggerFromForm(
+    scheduleFormFromTrigger({
+      on: "schedule",
+      timezone: DEFAULT_SCHEDULE_TIMEZONE,
+    }),
+  );
 }

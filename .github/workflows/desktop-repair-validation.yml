@@ -109,7 +109,10 @@ jobs:
             src/features/workflows/ui/useWorkflowListAuthorPresentations.test.mjs \
             src/features/workflows/ui/useWorkflowListMessagePresentations.test.mjs
           node --import ./test-loader.mjs --experimental-strip-types --test \
-            src/features/channels/observedUnreadNative.test.mjs
+            src/features/channels/observedUnreadNative.test.mjs \
+            src/features/workflows/ui/workflowSchedule.test.mjs \
+            src/features/workflows/ui/workflowFormTypes.test.mjs \
+            src/features/workflows/ui/workflowDefinition.test.mjs
           node --import ./test-jsdom-setup.mjs --import ./test-loader.mjs \
             --experimental-strip-types --test-force-exit --test \
             src/features/agents/ui/PersonaDeleteDialog.jsdom-test.mjs
@@ -119,6 +122,7 @@ jobs:
           env -u BUZZ_ACP_ALLOWED_RESPOND_TO -u BUZZ_ACP_LAZY_POOL -u BUZZ_ACP_IDLE_POOL_SLEEP cargo test -p buzz-acp error_outcome_emission_tests -- --test-threads=1
           cargo test -p buzz-acp pending_nonretryable_notice_skips_removed_channel
           cargo test -p buzz-cli workflows::tests
+          cargo test -p buzz-workflow
           cargo test -p buzz-agent --test fake_llm steer_rejected_on_empty_prompt
           cargo test -p buzz-acp session_resource
           cargo test -p buzz-acp cancelled_
