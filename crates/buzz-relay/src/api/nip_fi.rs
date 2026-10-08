@@ -19,9 +19,10 @@
 //!
 //! ## Environment variables
 //!
-//! The command API is enabled when `BUZZ_NIP_FI_MODE=enforce`.  S4 fields are
-//! read from the same `BUZZ_NIP_FI_ISSUERS` JSON array as the assertion
-//! policy; in enforce mode every issuer entry must carry them:
+//! The command API is enabled when `BUZZ_NIP_FI_MODE` is `enforce` or
+//! `shadow` (shadow keeps the deny entry but closes no session).  S4 fields
+//! are read from the same `BUZZ_NIP_FI_ISSUERS` JSON array as the assertion
+//! policy; in both modes every issuer entry must carry them:
 //!
 //! ```json
 //! {
@@ -42,15 +43,17 @@ use axum::{
     body::Body,
     extract::State,
     http::{HeaderMap, Response, StatusCode},
+    response::IntoResponse,
 };
 use serde::Deserialize;
 use tracing::{debug, warn};
 
 use buzz_auth::{
     CommandError, CommandIssuerPolicy, CommandVerifier, IssuerCapacity, JwksFetcher, NipFiDenyMap,
-    NipFiMode, ProductionJwksSource, CLIENT_ATTACHED_HEADER,
+    NipFiMode, ProductionJwksSource,
 };
 
+use crate::nip_fi_core::{extract_bearer_token, http_denial};
 use crate::state::AppState;
 
 /// Default per-issuer deny-set capacity when `deny_set_capacity` is absent.
@@ -89,28 +92,23 @@ pub async fn disconnect(
     body: axum::body::Bytes,
 ) -> Response<Body> {
     // ── Extract the command JWT from the header ────────────────────────────
-    let token = match extract_command_jwt(&headers) {
+    // Absent → 401 with `WWW-Authenticate: Nostr`; any other malformation
+    // → 403. [NIP-FI.md §Rejection table]
+    let token = match extract_bearer_token(&headers) {
         Ok(t) => t,
-        Err(status) => {
-            return if status == StatusCode::UNAUTHORIZED {
-                // [NIP-FI.md §Rejection table]: 401 MUST carry WWW-Authenticate: Nostr.
-                auth_required_response()
-            } else {
-                plain_response(status, "evidence rejected\n")
-            };
-        }
+        Err(class) => return http_denial(class),
     };
 
     // ── Parse the JSON body ───────────────────────────────────────────────
     let req: DisconnectRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
-        Err(_) => return plain_response(StatusCode::BAD_REQUEST, "bad request\n"),
+        Err(_) => return command_denial(CommandError::MalformedRequest),
     };
 
     // body.pubkey must be lowercase hex of exactly 32 bytes.
     let body_pubkey = match parse_hex_pubkey(&req.pubkey) {
         Some(k) => k,
-        None => return plain_response(StatusCode::BAD_REQUEST, "bad request\n"),
+        None => return command_denial(CommandError::MalformedRequest),
     };
 
     // ── Command verifier ──────────────────────────────────────────────────
@@ -119,10 +117,7 @@ pub async fn disconnect(
         None => {
             // Mode is Off or not yet initialized.
             debug!("nip-fi disconnect: no command verifier configured");
-            return plain_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "authorization unavailable\n",
-            );
+            return command_denial(CommandError::AuthorizationUnavailable);
         }
     };
 
@@ -142,23 +137,34 @@ pub async fn disconnect(
             let pubkey_bytes = cmd.target_pubkey.to_bytes();
             // Issuer-scoped: the deny entry is keyed by (caller_iss, k), so only
             // sessions admitted under caller_iss are closed. [FI-TRACE-DENY-SET]
-            let closed = state
-                .conn_manager
-                .disconnect_nip_fi(&cmd.caller_iss, &pubkey_bytes)
-                + state
-                    .community_connections
-                    .disconnect_nip_fi(&cmd.caller_iss, &pubkey_bytes);
+            // Shadow keeps the deny entry but closes nothing.
+            let closed = if !state.config.nip_fi.mode.observes_only() {
+                state
+                    .conn_manager
+                    .disconnect_nip_fi(&cmd.caller_iss, &pubkey_bytes)
+                    + state
+                        .community_connections
+                        .disconnect_nip_fi(&cmd.caller_iss, &pubkey_bytes)
+            } else {
+                state
+                    .nip_fi_shadow_sessions
+                    .would_close(&cmd.caller_iss, &pubkey_bytes);
+                0
+            };
             if closed > 0 {
                 // [FI-TRACE-PRIVACY-NONPUBLIC]: raw `iss` MUST NOT appear in
                 // logs, metrics, or traces.  Log only a count.
                 debug!(closed, "nip-fi disconnect: closed sessions");
             }
-            metrics::counter!("buzz_nip_fi_disconnect_total").increment(1);
-            metrics::counter!(
-                "buzz_nip_fi_sessions_closed_total",
-                "reason" => "admin_disconnect"
-            )
-            .increment(closed as u64);
+            let mode = state.config.nip_fi.mode;
+            count_disconnect_event(mode, "buzz_nip_fi_disconnect_total", "admin", "accepted", 1);
+            if !mode.observes_only() {
+                metrics::counter!(
+                    "buzz_nip_fi_sessions_closed_total",
+                    "reason" => "admin_disconnect"
+                )
+                .increment(closed as u64);
+            }
 
             // Cross-pod propagation: publish to global NIP-FI Redis channel
             // so remote pods can merge the deny entry and close their sessions.
@@ -166,35 +172,36 @@ pub async fn disconnect(
             {
                 let pubsub = Arc::clone(&state.pubsub);
                 let msg = nip_fi_disconnect_message(&cmd);
+                let channel = disconnect_publish_channel(state.config.nip_fi.mode);
                 state.nip_fi_publish_tasks.spawn(async move {
-                    if let Err(e) = pubsub.publish_nip_fi_disconnect(&msg).await {
+                    if let Err(e) = pubsub.publish_nip_fi_disconnect(channel, &msg).await {
                         // [FI-TRACE-PRIVACY-NONPUBLIC]: no iss or pubkey in logs
                         tracing::warn!("nip-fi: cross-pod propagation publish failed: {e}");
-                        metrics::counter!("buzz_nip_fi_disconnect_propagation_failures_total")
-                            .increment(1);
+                        count_disconnect_event(
+                            mode,
+                            "buzz_nip_fi_disconnect_propagation_failures_total",
+                            "admin",
+                            "propagation_failure",
+                            1,
+                        );
                     }
                 });
             }
 
             disconnected_response()
         }
-        Err(CommandError::DenySetFull) => {
-            warn!("nip-fi disconnect: deny set full — command rejected, no sessions closed");
-            metrics::counter!("buzz_nip_fi_disconnect_capacity_rejections_total").increment(1);
-            plain_response(StatusCode::SERVICE_UNAVAILABLE, "deny set full\n")
-        }
-        Err(CommandError::UntilExceedsCeiling) | Err(CommandError::MalformedRequest) => {
-            plain_response(StatusCode::BAD_REQUEST, "bad request\n")
-        }
-        Err(CommandError::AuthorizationUnavailable) => plain_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "authorization unavailable\n",
-        ),
-        Err(CommandError::EvidenceRejected) => {
-            plain_response(StatusCode::FORBIDDEN, "evidence rejected\n")
-        }
-        Err(CommandError::AuthorizationDenied) => {
-            plain_response(StatusCode::FORBIDDEN, "authorization denied\n")
+        Err(err) => {
+            if err == CommandError::DenySetFull {
+                warn!("nip-fi disconnect: deny set full — command rejected, no sessions closed");
+                count_disconnect_event(
+                    state.config.nip_fi.mode,
+                    "buzz_nip_fi_disconnect_capacity_rejections_total",
+                    "admin",
+                    "capacity",
+                    1,
+                );
+            }
+            command_denial(err)
         }
     }
 }
@@ -203,16 +210,16 @@ pub async fn disconnect(
 
 /// Per-issuer command configuration parsed from the `BUZZ_NIP_FI_ISSUERS` JSON.
 ///
-/// In enforce mode `maximum_command_age_seconds` and `authorized_principals`
-/// are required on every issuer and startup validation rejects any entry
-/// without them.  The fields remain `Option` for the off and `deny_protected`
+/// In enforce and shadow modes `maximum_command_age_seconds` and
+/// `authorized_principals` are required on every issuer and startup
+/// validation rejects any entry without them.  The fields remain `Option` for the off and `deny_protected`
 /// modes, which do not require them.
 #[derive(Debug, Default, Clone, serde::Deserialize)]
 pub struct CommandIssuerEnvConfig {
-    /// Maximum command JWT age in seconds, in `[1, 60]`.  Required in enforce mode.
+    /// Maximum command JWT age in seconds, in `[1, 60]`.  Required in enforce and shadow modes.
     pub maximum_command_age_seconds: Option<u64>,
     /// Non-empty list of authorized `sub` values, matched exactly
-    /// (case-sensitive).  Required in enforce mode.
+    /// (case-sensitive).  Required in enforce and shadow modes.
     pub authorized_principals: Option<Vec<String>>,
     /// Hard ceiling on live deny entries for this issuer; must be positive.
     /// Defaults to [`DEFAULT_DENY_SET_CAPACITY`] when absent.
@@ -225,6 +232,58 @@ pub struct NipFiCommandComponents<F: JwksFetcher = buzz_auth::HttpJwksFetcher> {
     pub deny_map: Arc<NipFiDenyMap>,
     /// The command verifier for the `POST /api/nip-fi/disconnect` endpoint.
     pub command_verifier: Arc<CommandVerifier<Arc<ProductionJwksSource<F>>>>,
+}
+
+/// Channel this pod publishes accepted disconnects on.  Shadow uses its own
+/// channel, so no enforce pod (of any build) ever acts on a shadow command.
+pub fn disconnect_publish_channel(mode: NipFiMode) -> &'static str {
+    if mode.observes_only() {
+        buzz_pubsub::conn_control::NIP_FI_SHADOW_DISCONNECT_CHANNEL
+    } else {
+        buzz_pubsub::conn_control::NIP_FI_DISCONNECT_CHANNEL
+    }
+}
+
+/// Channels this pod receives disconnects on.  Shadow also hears enforce's
+/// real disconnects so its deny record matches.
+pub fn disconnect_subscribe_channels(mode: NipFiMode) -> &'static [&'static str] {
+    use buzz_pubsub::conn_control::{NIP_FI_DISCONNECT_CHANNEL, NIP_FI_SHADOW_DISCONNECT_CHANNEL};
+    if mode.observes_only() {
+        &[NIP_FI_DISCONNECT_CHANNEL, NIP_FI_SHADOW_DISCONNECT_CHANNEL]
+    } else {
+        &[NIP_FI_DISCONNECT_CHANNEL]
+    }
+}
+
+/// Count a disconnect-path event on its `real` counter, or in shadow on
+/// `buzz_nip_fi_shadow_disconnect_total{route, outcome}` instead, so a
+/// shadow pod never moves an enforce disconnect metric.
+pub fn count_disconnect_event(
+    mode: NipFiMode,
+    real: &'static str,
+    route: &'static str,
+    outcome: &'static str,
+    n: u64,
+) {
+    if mode.observes_only() {
+        let labels = [("route", route), ("outcome", outcome)];
+        metrics::counter!("buzz_nip_fi_shadow_disconnect_total", &labels).increment(n);
+    } else {
+        metrics::counter!(real).increment(n);
+    }
+}
+
+/// Command replay guard for this pod.  Shadow claims under its own key
+/// prefix, so a shadow accept never uses up the enforce claim.
+pub fn command_replay_guard(
+    pool: deadpool_redis::Pool,
+    mode: NipFiMode,
+) -> Arc<dyn buzz_auth::CommandReplayGuard> {
+    if mode.observes_only() {
+        Arc::new(buzz_pubsub::RedisCommandReplayGuard::shadow(pool))
+    } else {
+        Arc::new(buzz_pubsub::RedisCommandReplayGuard::new(pool))
+    }
 }
 
 /// Outcome of applying a cross-pod NIP-FI disconnect message.
@@ -334,8 +393,12 @@ pub fn apply_nip_fi_disconnect(
     use buzz_auth::CrossPodMergeResult;
     let merge_result = deny_map.merge_cross_pod_deny(&message.issuer, &pubkey, until, now);
 
-    // Close sessions for all merge outcomes except UnknownIssuer.
+    // Close sessions for all merge outcomes except UnknownIssuer, never in shadow.
     let close_sessions = |reason: &str| {
+        if state.config.nip_fi.mode.observes_only() {
+            let sessions = &state.nip_fi_shadow_sessions;
+            return sessions.would_close(&message.issuer, &message.pubkey_bytes);
+        }
         let closed = state
             .conn_manager
             .disconnect_nip_fi(&message.issuer, &message.pubkey_bytes)
@@ -347,6 +410,13 @@ pub fn apply_nip_fi_disconnect(
         }
     };
 
+    let mode = state.config.nip_fi.mode;
+    // What a capacity or poison failsafe does to targeted sessions here.
+    let action = if mode.observes_only() {
+        "would-close recorded (shadow)"
+    } else {
+        "targeted sessions closed"
+    };
     match &merge_result {
         CrossPodMergeResult::Merged => {
             close_sessions("merged");
@@ -356,17 +426,21 @@ pub fn apply_nip_fi_disconnect(
         }
         CrossPodMergeResult::CapacityExceeded => {
             tracing::warn!(
-                "nip-fi cross-pod: deny set full for issuer — closing targeted sessions without map entry (capacity miss; issuer re-push is the recovery path)"
+                action,
+                "nip-fi cross-pod: deny set full for issuer — no map entry (capacity miss; issuer re-push is the recovery path)"
             );
             close_sessions("capacity-exceeded");
-            metrics::counter!("buzz_nip_fi_cross_pod_capacity_exceeded_total").increment(1);
+            let real = "buzz_nip_fi_cross_pod_capacity_exceeded_total";
+            count_disconnect_event(mode, real, "cross_pod", "capacity", 1);
         }
         CrossPodMergeResult::ShardPoisoned => {
             tracing::error!(
-                "nip-fi cross-pod: issuer shard is poisoned — sessions closed (fail-closed)"
+                action,
+                "nip-fi cross-pod: issuer shard is poisoned (fail-closed)"
             );
             close_sessions("poisoned shard failsafe");
-            metrics::counter!("buzz_nip_fi_cross_pod_shard_poison_total").increment(1);
+            let real = "buzz_nip_fi_cross_pod_shard_poison_total";
+            count_disconnect_event(mode, real, "cross_pod", "poison", 1);
         }
     }
 
@@ -387,7 +461,7 @@ pub fn build_nip_fi_command_components<F: JwksFetcher>(
     key_source: Arc<ProductionJwksSource<F>>,
     issuer_command_configs: &[(String, CommandIssuerEnvConfig)],
 ) -> Result<Option<NipFiCommandComponents<F>>, String> {
-    if matches!(mode, NipFiMode::Off) {
+    if mode.is_off() {
         return Ok(None);
     }
 
@@ -402,7 +476,7 @@ pub fn build_nip_fi_command_components<F: JwksFetcher>(
             None => {
                 // In enforce mode every issuer must be command-capable;
                 // from_env() already guarantees this, but be defensive here too.
-                if matches!(mode, NipFiMode::Enforce) {
+                if mode.evaluates() {
                     return Err(format!(
                         "nip-fi: enforce issuer [index {idx}] has no maximum_command_age_seconds — \
                          assertion-only issuers are not supported in enforce mode"
@@ -442,7 +516,7 @@ pub fn build_nip_fi_command_components<F: JwksFetcher>(
     }
 
     if command_policies.is_empty() {
-        if matches!(mode, NipFiMode::Enforce) {
+        if mode.evaluates() {
             // Enforce with no command-capable issuers is a misconfiguration:
             // from_env() guarantees every enforce issuer has command config, so
             // an empty set here means something was skipped or the configs are wrong.
@@ -499,7 +573,7 @@ pub fn install_nip_fi_command_components<F: JwksFetcher>(
     command_configs: &[(String, CommandIssuerEnvConfig)],
 ) -> Result<NipFiCommandStartupReport, String> {
     // Pre-flight: enforce mode with no command configs is always an error.
-    if matches!(mode, NipFiMode::Enforce) && command_configs.is_empty() {
+    if mode.evaluates() && command_configs.is_empty() {
         return Err(
             "NIP-FI install: enforce mode requires at least one command-capable issuer".to_owned(),
         );
@@ -544,29 +618,6 @@ pub fn validate_command_issuer_config(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Extract the command JWS token from the `Nostr-Federated-Identity: Bearer`
-/// header.  Returns `Err(401)` if the header is absent, `Err(403)` otherwise.
-///
-/// The same header is used for assertion tokens at upgrade and for command
-/// tokens at the admin API — distinct roles on distinct paths, never mixed.
-fn extract_command_jwt(headers: &HeaderMap) -> Result<&str, StatusCode> {
-    let mut values = headers.get_all(CLIENT_ATTACHED_HEADER).iter();
-    let first = values.next().ok_or(StatusCode::UNAUTHORIZED)?;
-    // Repeated header → reject.
-    if values.next().is_some() {
-        return Err(StatusCode::FORBIDDEN);
-    }
-    let raw = first.to_str().map_err(|_| StatusCode::FORBIDDEN)?;
-    if raw.contains(',') {
-        return Err(StatusCode::FORBIDDEN);
-    }
-    let token = raw.strip_prefix("Bearer ").ok_or(StatusCode::FORBIDDEN)?;
-    if token.is_empty() || token.contains(char::is_whitespace) {
-        return Err(StatusCode::FORBIDDEN);
-    }
-    Ok(token)
-}
-
 fn parse_hex_pubkey(raw: &str) -> Option<nostr::PublicKey> {
     if raw.len() != 64
         || !raw
@@ -583,18 +634,14 @@ fn plain_response(status: StatusCode, body: &'static str) -> Response<Body> {
         .status(status)
         .header("Content-Type", "text/plain; charset=utf-8")
         .body(Body::from(body))
-        .unwrap_or_else(|_| Response::new(Body::empty()))
+        .unwrap_or_else(|_| status.into_response())
 }
 
-/// Build the `401 authentication required` response with the mandatory
-/// `WWW-Authenticate: Nostr` header. [NIP-FI.md §Rejection table]
-fn auth_required_response() -> Response<Body> {
-    Response::builder()
-        .status(StatusCode::UNAUTHORIZED)
-        .header("Content-Type", "text/plain; charset=utf-8")
-        .header("WWW-Authenticate", "Nostr")
-        .body(Body::from("authentication required\n"))
-        .unwrap_or_else(|_| Response::new(Body::empty()))
+/// Render a command rejection with its spec-exact status and body.
+fn command_denial(err: CommandError) -> Response<Body> {
+    let status =
+        StatusCode::from_u16(err.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    plain_response(status, err.response_body())
 }
 
 /// Spec-exact 200 success response.
@@ -615,50 +662,6 @@ fn disconnected_response() -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderValue;
-
-    fn headers_with(value: &str) -> HeaderMap {
-        let mut h = HeaderMap::new();
-        h.insert(
-            CLIENT_ATTACHED_HEADER,
-            HeaderValue::from_str(value).unwrap(),
-        );
-        h
-    }
-
-    // ── JWT extraction contract ────────────────────────────────────────────
-
-    #[test]
-    fn absent_header_gives_401() {
-        let h = HeaderMap::new();
-        assert_eq!(extract_command_jwt(&h), Err(StatusCode::UNAUTHORIZED));
-    }
-
-    #[test]
-    fn repeated_header_gives_403() {
-        let mut h = HeaderMap::new();
-        h.append(
-            CLIENT_ATTACHED_HEADER,
-            HeaderValue::from_static("Bearer aaa.bbb.ccc"),
-        );
-        h.append(
-            CLIENT_ATTACHED_HEADER,
-            HeaderValue::from_static("Bearer ddd.eee.fff"),
-        );
-        assert_eq!(extract_command_jwt(&h), Err(StatusCode::FORBIDDEN));
-    }
-
-    #[test]
-    fn non_bearer_gives_403() {
-        let h = headers_with("Token aaa.bbb.ccc");
-        assert_eq!(extract_command_jwt(&h), Err(StatusCode::FORBIDDEN));
-    }
-
-    #[test]
-    fn valid_bearer_extracted() {
-        let h = headers_with("Bearer aaa.bbb.ccc");
-        assert_eq!(extract_command_jwt(&h), Ok("aaa.bbb.ccc"));
-    }
 
     // ── Hex pubkey parsing ────────────────────────────────────────────────
 
@@ -702,21 +705,6 @@ mod tests {
             b"{\"disconnected\": true}",
             "success body must be byte-exact per spec"
         );
-    }
-
-    /// `401` MUST carry `WWW-Authenticate: Nostr` and the spec body.
-    #[tokio::test]
-    async fn auth_required_response_has_www_authenticate() {
-        let resp = auth_required_response();
-        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        let www_auth = resp
-            .headers()
-            .get("WWW-Authenticate")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        assert_eq!(www_auth, "Nostr", "401 MUST carry WWW-Authenticate: Nostr");
-        let body_bytes = axum::body::to_bytes(resp.into_body(), 64).await.unwrap();
-        assert_eq!(body_bytes.as_ref(), b"authentication required\n");
     }
 
     /// `403` error responses MUST NOT carry `WWW-Authenticate`.
@@ -763,7 +751,7 @@ mod route_integration_tests {
     };
     use buzz_auth::{
         CommandIssuerPolicy, CommandVerifier, IssuerCapacity, IssuerRegistry, NipFiDenyMap,
-        ProductionJwksSource,
+        ProductionJwksSource, CLIENT_ATTACHED_HEADER,
     };
     use std::sync::Arc;
     use tower::ServiceExt;
@@ -1947,6 +1935,7 @@ mod route_integration_tests {
             jwks_configs: jwks_configs.clone(),
             command_configs: cmd_configs.clone(),
             max_connection_lifetime_secs: 3600,
+            communities: crate::nip_fi_core::test_support::any_host(TEST_AUD),
         };
 
         let pool = sqlx::PgPool::connect_lazy(&config.database_url).unwrap();
@@ -2010,7 +1999,8 @@ mod route_integration_tests {
         let key = nostr::Keys::generate();
         let token = mint_assertion_token(&key.public_key().to_hex());
         let verifier = state.nip_fi_verifier.as_deref().unwrap();
-        let result = verifier.verify_assertion(&token);
+        let result =
+            verifier.verify_assertion(&token, &crate::nip_fi_core::test_support::binding(TEST_AUD));
         assert!(
             result.is_ok(),
             "assertion verifier must read the warmed shared source; got: {result:?}"
@@ -2024,6 +2014,32 @@ mod route_integration_tests {
         assert!(
             result.is_ok(),
             "command verifier must read the same warmed shared source; got: {result:?}"
+        );
+    }
+
+    /// Shadow evaluates commands like enforce, so it shares enforce's
+    /// refusal to start without a command-capable issuer.
+    #[test]
+    fn installer_rejects_shadow_without_command_issuers() {
+        let key_source = Arc::new(
+            ProductionJwksSource::new(
+                vec![test_jwks_config()],
+                buzz_auth::ScriptedJwksFetcher::new([]),
+            )
+            .expect("valid key source"),
+        );
+        let err = super::install_nip_fi_command_components(
+            &mut None,
+            &mut None,
+            buzz_auth::NipFiMode::Shadow,
+            &IssuerRegistry::new(),
+            key_source,
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "NIP-FI install: enforce mode requires at least one command-capable issuer"
         );
     }
 
@@ -2259,6 +2275,64 @@ mod route_integration_tests {
         );
     }
 
+    // Pins: the cross-pod capacity and poison failsafes count on the real
+    // counters only in enforce; a shadow pod counts them on its own shadow
+    // disconnect counter, never on an enforce series.
+    // Mutation: reverting either site to its raw counter adds a real series
+    // to the shadow run (or drops the shadow series).
+    #[tokio::test(flavor = "current_thread")]
+    async fn cross_pod_failsafe_counters_stay_off_enforce_series_in_shadow() {
+        for (mode, expected) in [
+            (
+                buzz_auth::NipFiMode::Enforce,
+                vec![
+                    "buzz_nip_fi_cross_pod_capacity_exceeded_total".to_owned(),
+                    "buzz_nip_fi_cross_pod_shard_poison_total".to_owned(),
+                ],
+            ),
+            (
+                buzz_auth::NipFiMode::Shadow,
+                vec![
+                    "buzz_nip_fi_shadow_disconnect_total cross_pod capacity".to_owned(),
+                    "buzz_nip_fi_shadow_disconnect_total cross_pod poison".to_owned(),
+                ],
+            ),
+        ] {
+            let with_mode = |state: Arc<crate::state::AppState>| {
+                let mut state = (*state).clone();
+                Arc::make_mut(&mut state.config).nip_fi.mode = mode;
+                state
+            };
+            let full = with_mode(cross_pod_state(1).await);
+            let poisoned = with_mode(cross_pod_state(10).await);
+            poisoned
+                .nip_fi_deny_map
+                .as_deref()
+                .expect("deny map present")
+                .poison_shard_for_test(TEST_ISS);
+            let recorder = metrics_util::debugging::DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            for state in [&full, &full, &poisoned] {
+                let key = nostr::Keys::generate().public_key();
+                apply_nip_fi_disconnect(state, &cross_pod_message(&key), chrono::Utc::now());
+            }
+            let mut series: Vec<String> = snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .map(|(key, ..)| {
+                    let key = key.key();
+                    let labels = key.labels().map(|l| format!(" {}", l.value()));
+                    format!("{}{}", key.name(), labels.collect::<String>())
+                })
+                .filter(|name| name.starts_with("buzz_nip_fi"))
+                .collect();
+            series.sort();
+            assert_eq!(series, expected, "{mode:?}");
+        }
+    }
+
     // ── Cross-pod consumer: rejection and ceiling clamp ──────────────────────
     //
     // Only malformed messages are rejected.  An `until` beyond the receiving
@@ -2383,6 +2457,8 @@ mod route_integration_tests {
         let mut config = crate::config::Config::for_test();
         config.require_relay_membership = false;
         config.nip_fi.mode = buzz_auth::NipFiMode::Enforce;
+        config.nip_fi.communities =
+            crate::nip_fi_core::test_support::any_host("https://relay.test.example.com");
         config.nip_fi.registry.insert(issuer_policy(TEST_ISS));
         config.nip_fi.registry.insert(issuer_policy(OTHER_ISS));
         let mut state = build_test_app_state(1000, config).await;
@@ -2440,7 +2516,7 @@ mod route_integration_tests {
         iss: &str,
         key: &nostr::PublicKey,
     ) -> Result<(), axum::response::Response> {
-        let mut headers = HeaderMap::new();
+        let mut headers = crate::nip_fi_core::test_support::host_headers();
         headers.insert(
             CLIENT_ATTACHED_HEADER,
             format!("Bearer {}", mint_assertion_token_for(iss, &key.to_hex()))
@@ -2466,6 +2542,29 @@ mod route_integration_tests {
             .await
             .expect("body");
         assert_eq!(&body[..], b"authorization denied\n", "{why}");
+    }
+
+    // A valid community-A assertion presented on community B's Host is
+    // rejected on `aud`, even though B authorizes the same issuer.
+    #[tokio::test]
+    async fn http_admission_denies_community_a_assertion_on_community_b_host() {
+        let key = nostr::Keys::generate().public_key();
+        let mut state = (*http_enforce_state().await).clone();
+        assert!(
+            http_admit(&state, TEST_ISS, &key).is_ok(),
+            "control: the assertion is admitted on its own community"
+        );
+        Arc::make_mut(&mut state.config).nip_fi.communities =
+            crate::nip_fi_config::NipFiCommunities::for_test(
+                "https://relay.example",
+                &[TEST_ISS, OTHER_ISS],
+            );
+        let resp = http_admit(&state, TEST_ISS, &key).expect_err("A's aud on B's Host");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(&body[..], b"evidence rejected\n");
     }
 
     #[tokio::test]
@@ -2585,6 +2684,448 @@ mod route_integration_tests {
             .await
             .expect("body");
         assert_eq!(got, want, "Off-mode legacy response must be byte-identical");
+    }
+
+    // ── Characterization: exact disconnect-route rejection contract ──────────
+    //
+    // Pin status, Content-Type, WWW-Authenticate and body bytes for every
+    // pre-success rejection, plus the observable check order
+    // (header → JSON body → pubkey → verifier present → verify).
+
+    const PLAIN: &str = "text/plain; charset=utf-8";
+
+    async fn send_raw(
+        state: Arc<crate::state::AppState>,
+        header_values: Vec<axum::http::HeaderValue>,
+        body: &[u8],
+    ) -> axum::response::Response {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri(TEST_PATH)
+            .header("Content-Type", "application/json");
+        for v in header_values {
+            req = req.header(CLIENT_ATTACHED_HEADER, v);
+        }
+        crate::router::build_router(state)
+            .oneshot(req.body(Body::from(body.to_vec())).unwrap())
+            .await
+            .unwrap()
+    }
+
+    async fn assert_plain_denial(
+        resp: axum::response::Response,
+        status: StatusCode,
+        body: &str,
+        why: &str,
+    ) {
+        // Only the 401 carries a challenge. [NIP-FI.md §Rejection table]
+        let challenge = (status == StatusCode::UNAUTHORIZED).then_some("Nostr");
+        assert_eq!(resp.status(), status, "{why}");
+        let header = |name| {
+            resp.headers()
+                .get(name)
+                .map(|v: &axum::http::HeaderValue| v.to_str().unwrap().to_owned())
+        };
+        assert_eq!(header("Content-Type").as_deref(), Some(PLAIN), "{why}");
+        assert_eq!(header("WWW-Authenticate").as_deref(), challenge, "{why}");
+        let got = axum::body::to_bytes(resp.into_body(), 256).await.unwrap();
+        assert_eq!(got.as_ref(), body.as_bytes(), "{why}");
+    }
+
+    fn valid_body() -> &'static [u8] {
+        // A syntactically valid body: the pubkey is well-formed lowercase hex.
+        br#"{"pubkey":"79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"}"#
+    }
+
+    #[tokio::test]
+    async fn characterize_route_header_transport_rejections() {
+        use axum::http::HeaderValue;
+        let state = build_test_state(1000).await;
+        let missing = send_raw(Arc::clone(&state), vec![], valid_body()).await;
+        assert_plain_denial(
+            missing,
+            StatusCode::UNAUTHORIZED,
+            "authentication required\n",
+            "missing header",
+        )
+        .await;
+
+        let rejected: Vec<(&str, Vec<HeaderValue>)> = vec![
+            (
+                "repeated header",
+                vec![
+                    HeaderValue::from_static("Bearer aaa.bbb.ccc"),
+                    HeaderValue::from_static("Bearer ddd.eee.fff"),
+                ],
+            ),
+            (
+                "comma-joined value",
+                vec![HeaderValue::from_static("Bearer aaa.bbb.ccc,ddd.eee.fff")],
+            ),
+            (
+                "non-Bearer scheme",
+                vec![HeaderValue::from_static("Token aaa.bbb.ccc")],
+            ),
+            ("empty token", vec![HeaderValue::from_static("Bearer ")]),
+            (
+                "space in token",
+                vec![HeaderValue::from_static("Bearer aaa bbb")],
+            ),
+            (
+                "tab in token",
+                vec![HeaderValue::from_static("Bearer aaa\tbbb")],
+            ),
+            // U+00A0 is `char::is_whitespace` but not ASCII whitespace; the
+            // obs-text bytes fail `HeaderValue::to_str`, so it rejects before
+            // any whitespace predicate runs.
+            (
+                "non-ASCII whitespace in token",
+                vec![HeaderValue::from_bytes(b"Bearer aaa\xc2\xa0bbb").unwrap()],
+            ),
+        ];
+        // A malformed body makes a dropped transport check observable: it
+        // would surface as 400 from body parsing, not the same 403 the
+        // verifier would give.
+        for (why, values) in rejected {
+            let resp = send_raw(Arc::clone(&state), values, b"not json").await;
+            assert_plain_denial(resp, StatusCode::FORBIDDEN, "evidence rejected\n", why).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn characterize_route_check_order_before_verify() {
+        use axum::http::HeaderValue;
+        let state = build_test_state(1000).await;
+        let bearer = || vec![HeaderValue::from_static("Bearer aaa.bbb.ccc")];
+
+        // Header is checked before the JSON body.
+        let resp = send_raw(Arc::clone(&state), vec![], b"not json").await;
+        assert_plain_denial(
+            resp,
+            StatusCode::UNAUTHORIZED,
+            "authentication required\n",
+            "missing header + malformed JSON",
+        )
+        .await;
+        let resp = send_raw(
+            Arc::clone(&state),
+            vec![HeaderValue::from_static("Token x")],
+            br#"{"pubkey":"NOT-HEX"}"#,
+        )
+        .await;
+        assert_plain_denial(
+            resp,
+            StatusCode::FORBIDDEN,
+            "evidence rejected\n",
+            "bad scheme + bad pubkey",
+        )
+        .await;
+
+        // Body shape is checked before the (garbage) token is verified.
+        for (why, body) in [
+            ("malformed JSON", b"not json".as_slice()),
+            ("missing pubkey field", br#"{}"#.as_slice()),
+            (
+                "uppercase pubkey",
+                br#"{"pubkey":"79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798"}"#
+                    .as_slice(),
+            ),
+            ("short pubkey", br#"{"pubkey":"abcd"}"#.as_slice()),
+        ] {
+            let resp = send_raw(Arc::clone(&state), bearer(), body).await;
+            assert_plain_denial(resp, StatusCode::BAD_REQUEST, "bad request\n", why).await;
+        }
+
+        // No verifier: body/pubkey still precede the verifier check, and the
+        // verifier check precedes verification (the token is garbage).
+        let mut no_verifier = build_test_app_state(1000, crate::config::Config::for_test()).await;
+        no_verifier.nip_fi_command_verifier = None;
+        let no_verifier = Arc::new(no_verifier);
+        let resp = send_raw(Arc::clone(&no_verifier), bearer(), br#"{"pubkey":"abcd"}"#).await;
+        assert_plain_denial(
+            resp,
+            StatusCode::BAD_REQUEST,
+            "bad request\n",
+            "bad pubkey precedes verifier presence",
+        )
+        .await;
+        let resp = send_raw(no_verifier, bearer(), valid_body()).await;
+        assert_plain_denial(
+            resp,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authorization unavailable\n",
+            "no command verifier configured",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn characterize_route_command_error_arms() {
+        let post = |state: Arc<crate::state::AppState>, token: String, target: String| async move {
+            do_request(
+                state,
+                "POST",
+                vec![
+                    ("Content-Type", "application/json".into()),
+                    (CLIENT_ATTACHED_HEADER, format!("Bearer {token}")),
+                ],
+                Some(serde_json::json!({ "pubkey": target })),
+            )
+            .await
+        };
+        let state = build_test_state(1).await;
+
+        let t = target_hex();
+        let tampered = format!("{}X", mint_token(&t, 300, serde_json::json!({})));
+        let resp = post(Arc::clone(&state), tampered, t).await;
+        assert_plain_denial(
+            resp,
+            StatusCode::FORBIDDEN,
+            "evidence rejected\n",
+            "EvidenceRejected",
+        )
+        .await;
+
+        let t = target_hex();
+        let token = mint_token(&t, 300, serde_json::json!({"sub": "intruder@example.com"}));
+        let resp = post(Arc::clone(&state), token, t).await;
+        assert_plain_denial(
+            resp,
+            StatusCode::FORBIDDEN,
+            "authorization denied\n",
+            "AuthorizationDenied",
+        )
+        .await;
+
+        let t = target_hex();
+        let token = mint_token(&t, 10 * 365 * 24 * 3600, serde_json::json!({}));
+        let resp = post(Arc::clone(&state), token, t).await;
+        assert_plain_denial(
+            resp,
+            StatusCode::BAD_REQUEST,
+            "bad request\n",
+            "UntilExceedsCeiling",
+        )
+        .await;
+
+        // Fill the capacity-1 deny set, then the next distinct target is full.
+        let t = target_hex();
+        let resp = post(
+            Arc::clone(&state),
+            mint_token(&t, 300, serde_json::json!({})),
+            t,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "control: slot filled");
+        let t = target_hex();
+        let resp = post(
+            Arc::clone(&state),
+            mint_token(&t, 300, serde_json::json!({})),
+            t,
+        )
+        .await;
+        assert_plain_denial(
+            resp,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "deny set full\n",
+            "DenySetFull",
+        )
+        .await;
+
+        // An unseeded key source has no key set for the issuer.
+        let mut unseeded = build_test_app_state(1000, crate::config::Config::for_test()).await;
+        let key_source = Arc::new(
+            ProductionJwksSource::new(vec![test_jwks_config()], buzz_auth::HttpJwksFetcher::new())
+                .expect("key source"),
+        );
+        let mut registry = IssuerRegistry::new();
+        registry.insert(test_issuer_policy());
+        let deny_map = NipFiDenyMap::new(
+            1000,
+            vec![IssuerCapacity {
+                issuer: TEST_ISS.to_owned(),
+                capacity: 1000,
+            }],
+        );
+        let policy =
+            CommandIssuerPolicy::new(TEST_ISS.to_owned(), 30, vec![TEST_SUB.to_owned()], 1000)
+                .expect("command policy");
+        unseeded.nip_fi_command_verifier = Some(Arc::new(CommandVerifier::new(
+            registry,
+            key_source,
+            vec![policy],
+            deny_map,
+        )));
+        let t = target_hex();
+        let token = mint_token(&t, 300, serde_json::json!({}));
+        let resp = post(Arc::new(unseeded), token, t).await;
+        assert_plain_denial(
+            resp,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "authorization unavailable\n",
+            "AuthorizationUnavailable",
+        )
+        .await;
+    }
+
+    /// Pins: an admin disconnect counts its accept and its capacity rejection
+    /// on the real counters only in enforce; a shadow pod answers the same
+    /// way but counts both on its shadow disconnect counter.
+    /// Mutation: reverting either admin site to its raw counter puts a real
+    /// series in the shadow run.
+    #[test]
+    fn admin_disconnect_counters_stay_off_enforce_series_in_shadow() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current_thread runtime");
+        for (mode, expected) in [
+            (
+                NipFiMode::Enforce,
+                vec![
+                    "buzz_nip_fi_disconnect_capacity_rejections_total",
+                    "buzz_nip_fi_disconnect_total",
+                    "buzz_nip_fi_sessions_closed_total admin_disconnect",
+                ],
+            ),
+            (
+                NipFiMode::Shadow,
+                vec![
+                    "buzz_nip_fi_shadow_disconnect_total admin accepted",
+                    "buzz_nip_fi_shadow_disconnect_total admin capacity",
+                ],
+            ),
+        ] {
+            let mut config = crate::config::Config::for_test();
+            config.nip_fi.mode = mode;
+            config.nip_fi.registry.insert(test_issuer_policy());
+            let state = Arc::new(rt.block_on(build_test_app_state(1, config)));
+            let recorder = metrics_util::debugging::DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let statuses = metrics::with_local_recorder(&recorder, || {
+                rt.block_on(async {
+                    let mut statuses = Vec::new();
+                    for _ in 0..2 {
+                        let t = target_hex();
+                        let token = mint_token(&t, 300, serde_json::json!({}));
+                        statuses.push(post_command(&state, &token, &t).await.0);
+                    }
+                    statuses
+                })
+            });
+            assert_eq!(
+                statuses,
+                [StatusCode::OK, StatusCode::SERVICE_UNAVAILABLE],
+                "{mode:?}"
+            );
+            let mut series: Vec<String> = snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .map(|(key, ..)| {
+                    let key = key.key();
+                    let labels = key.labels().map(|l| format!(" {}", l.value()));
+                    format!("{}{}", key.name(), labels.collect::<String>())
+                })
+                .filter(|name| name.starts_with("buzz_nip_fi"))
+                .collect();
+            series.sort();
+            assert_eq!(series, expected, "{mode:?}");
+        }
+    }
+
+    /// `buzz_nip_fi_disconnect_capacity_rejections_total` counts exactly the
+    /// `DenySetFull` rejections and no other command-error arm.
+    ///
+    /// `#[test]` with a current-thread runtime, not `#[tokio::test]`:
+    /// `metrics::with_local_recorder` is thread-local and takes a sync closure,
+    /// so each request runs to completion on this thread inside its own
+    /// recorder's scope.
+    #[test]
+    fn capacity_rejection_counter_counts_only_deny_set_full() {
+        use axum::body::Bytes;
+
+        fn capacity_rejections_during(
+            rt: &tokio::runtime::Runtime,
+            request: impl std::future::Future<Output = (StatusCode, Bytes)>,
+        ) -> ((StatusCode, Bytes), u64) {
+            let recorder = metrics_util::debugging::DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let response = metrics::with_local_recorder(&recorder, || rt.block_on(request));
+            let count = snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find(|(key, ..)| {
+                    key.key().name() == "buzz_nip_fi_disconnect_capacity_rejections_total"
+                })
+                .map_or(0, |(.., value)| match value {
+                    metrics_util::debugging::DebugValue::Counter(n) => n,
+                    other => panic!("capacity rejections must be a counter, got {other:?}"),
+                });
+            (response, count)
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current_thread runtime");
+        let state = rt.block_on(build_test_state(1));
+
+        let t = target_hex();
+        let tampered = format!("{}X", mint_token(&t, 300, serde_json::json!({})));
+        let intruder = mint_token(&t, 300, serde_json::json!({"sub": "intruder@example.com"}));
+        let far_until = mint_token(&t, 10 * 365 * 24 * 3600, serde_json::json!({}));
+        for (why, token, status, body) in [
+            (
+                "EvidenceRejected",
+                tampered,
+                StatusCode::FORBIDDEN,
+                "evidence rejected\n",
+            ),
+            (
+                "AuthorizationDenied",
+                intruder,
+                StatusCode::FORBIDDEN,
+                "authorization denied\n",
+            ),
+            (
+                "UntilExceedsCeiling",
+                far_until,
+                StatusCode::BAD_REQUEST,
+                "bad request\n",
+            ),
+        ] {
+            let (response, count) =
+                capacity_rejections_during(&rt, post_command(&state, &token, &t));
+            assert_eq!(
+                response,
+                (status, Bytes::from_static(body.as_bytes())),
+                "{why}"
+            );
+            assert_eq!(count, 0, "{why} must not count as a capacity rejection");
+        }
+
+        // Fill the capacity-1 deny set, then the next distinct target is full.
+        let t = target_hex();
+        let (filled, _) = rt.block_on(post_command(
+            &state,
+            &mint_token(&t, 300, serde_json::json!({})),
+            &t,
+        ));
+        assert_eq!(filled, StatusCode::OK, "control: slot filled");
+        let t = target_hex();
+        let token = mint_token(&t, 300, serde_json::json!({}));
+        let (response, count) = capacity_rejections_during(&rt, post_command(&state, &token, &t));
+        assert_eq!(
+            response,
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Bytes::from_static(b"deny set full\n")
+            ),
+            "DenySetFull"
+        );
+        assert_eq!(count, 1, "DenySetFull must count one capacity rejection");
     }
 
     // ── Cross-pod command replay fence ───────────────────────────────────────
@@ -2929,8 +3470,9 @@ mod route_integration_tests {
         let state = pod(1, replay).await;
         let filler = target_hex();
         let target = target_hex();
-        // The filler entry expires within two seconds and frees the only slot.
-        let filler_token = mint_token(&filler, 1, serde_json::json!({}));
+        // `until` is a whole second, so an offset of 2 keeps the filler alive
+        // for at least one second and frees the only slot before the retry.
+        let filler_token = mint_token(&filler, 2, serde_json::json!({}));
         assert_eq!(
             post_command(&state, &filler_token, &filler).await.0,
             StatusCode::OK
@@ -2969,6 +3511,245 @@ mod route_integration_tests {
                 .create_pool(Some(deadpool_redis::Runtime::Tokio1))
                 .expect("redis pool");
             Arc::new(buzz_pubsub::RedisCommandReplayGuard::new(pool))
+        }
+
+        async fn pod_in(mode: NipFiMode) -> Arc<AppState> {
+            let mut config = crate::config::Config::for_test();
+            config.nip_fi.mode = mode;
+            config.nip_fi.registry.insert(test_issuer_policy());
+            let mut state = build_test_app_state(1000, config).await;
+            state.nip_fi_command_replay =
+                command_replay_guard(state.redis_pool.clone(), state.config.nip_fi.mode);
+            Arc::new(state)
+        }
+
+        /// Shadow startup goes through the same `AppState::new` as production:
+        /// it builds the assertion verifier, installs a command verifier on
+        /// the shared key source, and claims commands under the shadow replay
+        /// prefix, leaving the enforce claim for an enforce pod.
+        #[tokio::test]
+        #[ignore = "requires Redis"]
+        async fn app_state_new_in_shadow_builds_verifiers_and_shadow_replay_guard() {
+            use crate::nip_fi_config::NipFiRelayConfig;
+            use buzz_auth::CommandReplayGuard as _;
+
+            let mut config = crate::config::Config::for_test();
+            config.redis_url = std::env::var("BUZZ_TEST_REDIS_URL")
+                .or_else(|_| std::env::var("REDIS_URL"))
+                .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+            let mut registry = IssuerRegistry::new();
+            registry.insert(test_issuer_policy());
+            let command_configs = vec![(
+                TEST_ISS.to_owned(),
+                CommandIssuerEnvConfig {
+                    maximum_command_age_seconds: Some(30),
+                    authorized_principals: Some(vec![TEST_SUB.to_owned()]),
+                    deny_set_capacity: Some(100),
+                },
+            )];
+            config.nip_fi = NipFiRelayConfig {
+                mode: NipFiMode::Shadow,
+                registry: registry.clone(),
+                jwks_configs: vec![test_jwks_config()],
+                command_configs: command_configs.clone(),
+                max_connection_lifetime_secs: 3600,
+                communities: crate::nip_fi_core::test_support::any_host(TEST_AUD),
+            };
+            let pool = sqlx::PgPool::connect_lazy(&config.database_url).unwrap();
+            let db = buzz_db::Db::from_pool(pool.clone());
+            let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                .unwrap();
+            let pubsub = Arc::new(
+                buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                    .await
+                    .unwrap(),
+            );
+            let (mut state, _) = crate::state::AppState::new(
+                config.clone(),
+                db.clone(),
+                redis_pool.clone(),
+                buzz_audit::AuditService::new(pool.clone()),
+                pubsub,
+                buzz_auth::AuthService::new(config.auth.clone()),
+                buzz_search::SearchService::new(pool),
+                Arc::new(buzz_workflow::WorkflowEngine::new(
+                    db,
+                    buzz_workflow::WorkflowConfig::default(),
+                )),
+                nostr::Keys::generate(),
+                buzz_media::MediaStorage::new(&config.media).unwrap(),
+            );
+            assert!(
+                state.nip_fi_verifier.is_some(),
+                "shadow must build the verifier"
+            );
+            let source = state.nip_fi_jwks_source.clone().expect("shared key source");
+            super::super::install_nip_fi_command_components(
+                &mut state.nip_fi_deny_map,
+                &mut state.nip_fi_command_verifier,
+                NipFiMode::Shadow,
+                &registry,
+                Arc::clone(&source),
+                &command_configs,
+            )
+            .expect("shadow installs the command verifier");
+            source.seed_snapshot_for_test(TEST_ISS, test_jwks()).await;
+            let target = nostr::Keys::generate().public_key();
+            let command = mint_token(&target.to_hex(), 300, serde_json::json!({}));
+            let verifier = state.nip_fi_command_verifier.as_ref().unwrap();
+            let verified =
+                verifier.verify_at(&command, "POST", TEST_PATH, &target, chrono::Utc::now());
+            assert!(verified.is_ok(), "shadow verifies commands: {verified:?}");
+
+            let jti = uuid::Uuid::new_v4().to_string();
+            assert!(state
+                .nip_fi_command_replay
+                .try_claim(TEST_ISS, &jti, 60)
+                .await
+                .unwrap());
+            let shadow = buzz_pubsub::RedisCommandReplayGuard::shadow(redis_pool.clone());
+            let enforce = buzz_pubsub::RedisCommandReplayGuard::new(redis_pool);
+            assert!(
+                !shadow.try_claim(TEST_ISS, &jti, 60).await.unwrap(),
+                "claim is shadow-prefixed"
+            );
+            assert!(
+                enforce.try_claim(TEST_ISS, &jti, 60).await.unwrap(),
+                "enforce claim untouched"
+            );
+        }
+
+        /// Run `state`'s production disconnect subscriber and apply what it
+        /// hears through the production consumer, like `main.rs`.  Yields
+        /// the target of each applied message.
+        fn listen(state: &Arc<AppState>) -> tokio::sync::mpsc::UnboundedReceiver<Vec<u8>> {
+            let mut rx = state.pubsub.subscribe_nip_fi_disconnect();
+            let channels = disconnect_subscribe_channels(state.config.nip_fi.mode);
+            tokio::spawn(Arc::clone(&state.pubsub).run_nip_fi_disconnect_subscriber(channels));
+            let consumer = Arc::clone(state);
+            let (seen_tx, seen) = tokio::sync::mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                while let Ok(msg) = rx.recv().await {
+                    apply_nip_fi_disconnect(&consumer, &msg, chrono::Utc::now());
+                    let _ = seen_tx.send(msg.pubkey_bytes);
+                }
+            });
+            seen
+        }
+
+        /// Return once a probe that `prober` publishes has been applied via
+        /// `seen`: the subscription is live, and anything published earlier
+        /// on the probe's channel has been applied.
+        async fn await_probe(
+            seen: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+            prober: &Arc<AppState>,
+        ) {
+            for _ in 0..50 {
+                let probe = nostr::Keys::generate().public_key();
+                let token = mint_token(&probe.to_hex(), 300, serde_json::json!({}));
+                post_command(prober, &token, &probe.to_hex()).await;
+                drain_publishes(prober).await;
+                let wait = std::time::Duration::from_millis(200);
+                while let Ok(Some(k)) = tokio::time::timeout(wait, seen.recv()).await {
+                    if k == probe.to_bytes().to_vec() {
+                        return;
+                    }
+                }
+            }
+            panic!("disconnect subscriber never received a probe");
+        }
+
+        /// Return once `seen` has applied a message for `key`.
+        async fn await_target(
+            seen: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+            key: &nostr::PublicKey,
+        ) {
+            let wait = std::time::Duration::from_secs(5);
+            while let Ok(Some(k)) = tokio::time::timeout(wait, seen.recv()).await {
+                if k == key.to_bytes().to_vec() {
+                    return;
+                }
+            }
+            panic!("disconnect subscriber never received the target");
+        }
+
+        // Pins finding 1 (disconnect half): a shadow disconnect goes out only
+        // on the shadow channel, so an enforce pod denies and closes nothing.
+        // Other shadow pods receive it and record the deny; no shadow pod
+        // closes a session, whether the command came from shadow or enforce.
+        // Mutation: publishing shadow commands on `NIP_FI_DISCONNECT_CHANNEL`
+        // closes the enforce session; letting a shadow pod close on a
+        // received command fails `assert_open` on the shadow pods.
+        #[tokio::test]
+        #[ignore = "requires Redis"]
+        async fn shadow_disconnect_never_reaches_an_enforce_pod() {
+            let shadow = pod_in(NipFiMode::Shadow).await;
+            let peer = pod_in(NipFiMode::Shadow).await;
+            let enforce = pod_in(NipFiMode::Enforce).await;
+            let mut enforce_seen = listen(&enforce);
+            let mut shadow_seen = listen(&shadow);
+            let mut peer_seen = listen(&peer);
+            await_probe(&mut enforce_seen, &enforce).await;
+            await_probe(&mut shadow_seen, &enforce).await;
+            await_probe(&mut peer_seen, &enforce).await;
+            let key = nostr::Keys::generate().public_key();
+            let on_shadow = IssuerSessions::register(&shadow, TEST_ISS, &key);
+            let on_peer = IssuerSessions::register(&peer, TEST_ISS, &key);
+            let on_enforce = IssuerSessions::register(&enforce, TEST_ISS, &key);
+
+            let token = mint_token(&key.to_hex(), 300, serde_json::json!({}));
+            let (status, body) = post_command(&shadow, &token, &key.to_hex()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(&body[..], br#"{"disconnected": true}"#);
+            assert!(is_denied(&shadow, &key), "shadow records its deny");
+            on_shadow.assert_open("shadow pod");
+            drain_publishes(&shadow).await;
+            // Anything the enforce pod would hear from that publish has
+            // arrived once a later enforce-channel probe has.
+            await_probe(&mut enforce_seen, &enforce).await;
+            assert!(!is_denied(&enforce, &key), "enforce records no shadow deny");
+            on_enforce.assert_open("enforce pod");
+            await_target(&mut peer_seen, &key).await;
+            assert!(
+                is_denied(&peer, &key),
+                "a second shadow pod records the deny"
+            );
+            on_peer.assert_open("second shadow pod");
+
+            // An enforce disconnect reaching a shadow pod records the deny
+            // and closes nothing there.
+            let target = nostr::Keys::generate().public_key();
+            let target_on_shadow = IssuerSessions::register(&shadow, TEST_ISS, &target);
+            let token = mint_token(&target.to_hex(), 300, serde_json::json!({}));
+            let (status, _) = post_command(&enforce, &token, &target.to_hex()).await;
+            assert_eq!(status, StatusCode::OK);
+            drain_publishes(&enforce).await;
+            await_target(&mut shadow_seen, &target).await;
+            assert!(is_denied(&shadow, &target), "shadow records enforce's deny");
+            target_on_shadow.assert_open("shadow pod, enforce command");
+        }
+
+        // Pins finding 1 (replay half): shadow and enforce share one Redis
+        // but claim under disjoint prefixes, so a shadow accept leaves the
+        // command usable by enforce, while shadow still rejects its own
+        // replay.  Mutation: a shadow guard on the enforce prefix makes the
+        // enforce use a 403.
+        #[tokio::test]
+        #[ignore = "requires Redis"]
+        async fn shadow_command_claim_never_uses_up_enforce_claim() {
+            let shadow = pod_in(NipFiMode::Shadow).await;
+            let enforce = pod_in(NipFiMode::Enforce).await;
+            let key = nostr::Keys::generate().public_key();
+            let token = mint_token(&key.to_hex(), 300, serde_json::json!({}));
+
+            let (status, _) = post_command(&shadow, &token, &key.to_hex()).await;
+            assert_eq!(status, StatusCode::OK, "shadow accepts first use");
+            let (status, _) = post_command(&enforce, &token, &key.to_hex()).await;
+            assert_eq!(status, StatusCode::OK, "enforce still accepts it");
+            let (status, body) = post_command(&shadow, &token, &key.to_hex()).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "shadow rejects its replay");
+            assert_eq!(body.as_ref(), b"authorization denied\n");
         }
 
         #[tokio::test]

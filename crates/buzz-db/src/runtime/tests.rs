@@ -78,7 +78,7 @@ async fn setup_db() -> Db {
 }
 
 #[tokio::test]
-async fn begin_transaction_compatibility_alias_is_preserved() {
+async fn event_write_transaction_preserves_legacy_acquisition_metrics() {
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 
     let pool = sqlx::postgres::PgPoolOptions::new()
@@ -90,8 +90,9 @@ async fn begin_transaction_compatibility_alias_is_preserved() {
     let snapshotter = recorder.snapshotter();
     let _guard = metrics::set_default_local_recorder(&recorder);
 
-    #[allow(deprecated)]
-    let result = db.begin_transaction().await;
+    let result = db
+        .begin_event_write_transaction(CommunityId::from_uuid(Uuid::new_v4()))
+        .await;
     assert!(matches!(
         result,
         Err(DbError::Sqlx(sqlx::Error::PoolClosed))
@@ -167,6 +168,69 @@ fn nip43_reconciliation_compatibility_alias_is_preserved() {
     }
 
     let _ = call;
+}
+
+#[tokio::test]
+async fn community_write_transaction_compatibility_metrics_are_limited_to_legacy_entrypoints() {
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy(&crate::test_support::database_url())
+        .expect("construct lazy compatibility pool");
+    pool.close().await;
+    let db = Db::from_pool(pool);
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let community = CommunityId::from_uuid(Uuid::new_v4());
+
+    let direct = begin_community_event_write_transaction(
+        &db.pool,
+        community,
+        observability::WriterOperation::EventWrite,
+    )
+    .await;
+    assert!(matches!(
+        direct,
+        Err(DbError::Sqlx(sqlx::Error::PoolClosed))
+    ));
+    assert_eq!(
+        legacy_acquisition_count(&snapshotter.snapshot().into_vec()),
+        0,
+        "typed-only tenant-local chokepoint must not emit legacy compatibility metrics"
+    );
+
+    let legacy = db.begin_event_write_transaction(community).await;
+    assert!(matches!(
+        legacy,
+        Err(DbError::Sqlx(sqlx::Error::PoolClosed))
+    ));
+    assert_eq!(
+        legacy_acquisition_count(&snapshotter.snapshot().into_vec()),
+        1,
+        "Db::begin_event_write_transaction must preserve the legacy compatibility population"
+    );
+}
+
+fn legacy_acquisition_count(
+    snapshot: &[(
+        metrics_util::CompositeKey,
+        Option<metrics::Unit>,
+        Option<metrics::SharedString>,
+        metrics_util::debugging::DebugValue,
+    )],
+) -> u64 {
+    snapshot
+        .iter()
+        .filter_map(|(key, _, _, value)| {
+            (key.key().name() == "buzz_db_pool_acquisitions_total")
+                .then_some(value)
+                .map(|value| match value {
+                    metrics_util::debugging::DebugValue::Counter(value) => *value,
+                    _ => panic!("legacy acquisitions must be a counter"),
+                })
+        })
+        .sum()
 }
 
 #[tokio::test]
@@ -3116,6 +3180,141 @@ async fn armed_pool_rejects_old_channel_inserts_through_public_api() {
     drop_scratch_db(&admin, seed_pool, &name).await;
     // db pool still holds connections to the dropped DB; close it.
     db.pool.close().await;
+}
+
+/// A writer transaction holding the shared replica-floor advisory lock, the
+/// shape a floor-compliant writer takes before the exclusive probe can run.
+async fn begin_replica_floor_locked_writer(db: &Db) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut tx = db
+        .pool
+        .begin()
+        .await
+        .expect("begin floor-guarded writer tx");
+    sqlx::query("SELECT pg_advisory_xact_lock_shared($1)")
+        .bind(crate::replica_fence::REPLICA_FLOOR_LOCK_KEY)
+        .execute(&mut *tx)
+        .await
+        .expect("take shared replica-floor lock");
+    tx
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn replica_floor_writer_transaction_holds_shared_lock() {
+    let admin = PgPool::connect(&admin_url().await)
+        .await
+        .expect("connect admin");
+    let (seed_pool, name) = create_scratch_db(&admin, "floor_writer_foundation").await;
+
+    let base = admin_url().await;
+    let idx = base.rfind('/').expect("db url has a path segment");
+    let scratch_url = format!("{}/{}", &base[..idx], name);
+    let db = Db::new(&DbConfig {
+        database_url: scratch_url,
+        max_connections: 3,
+        ..DbConfig::default()
+    })
+    .await
+    .expect("connect armed Db");
+
+    let writer = begin_replica_floor_locked_writer(&db).await;
+
+    let mut shared_contender = db.pool.begin().await.expect("begin shared contender");
+    let shared_taken: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock_shared($1)")
+        .bind(crate::replica_fence::REPLICA_FLOOR_LOCK_KEY)
+        .fetch_one(&mut *shared_contender)
+        .await
+        .expect("probe shared floor lock");
+    assert!(
+        shared_taken,
+        "compliant writer must allow another shared replica-floor lock holder"
+    );
+    shared_contender
+        .rollback()
+        .await
+        .expect("rollback shared contender");
+
+    let mut contender = db.pool.begin().await.expect("begin exclusive contender");
+    let exclusive_taken: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+        .bind(crate::replica_fence::REPLICA_FLOOR_LOCK_KEY)
+        .fetch_one(&mut *contender)
+        .await
+        .expect("probe exclusive floor lock");
+    assert!(
+        !exclusive_taken,
+        "compliant writer must hold the shared replica-floor advisory lock"
+    );
+
+    contender
+        .rollback()
+        .await
+        .expect("rollback exclusive contender");
+    writer.rollback().await.expect("rollback writer tx");
+    db.pool.close().await;
+    drop_scratch_db(&admin, seed_pool, &name).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn replica_floor_probe_waits_for_shared_writer_and_records_after_release() {
+    let admin = PgPool::connect(&admin_url().await)
+        .await
+        .expect("connect admin");
+    let (seed_pool, name) = create_scratch_db(&admin, "floor_probe_foundation").await;
+
+    let base = admin_url().await;
+    let idx = base.rfind('/').expect("db url has a path segment");
+    let scratch_url = format!("{}/{}", &base[..idx], name);
+    let db = Db::new(&DbConfig {
+        database_url: scratch_url,
+        max_connections: 2,
+        ..DbConfig::default()
+    })
+    .await
+    .expect("connect armed Db");
+
+    let token_before: i64 = sqlx::query_scalar("SELECT token FROM replica_heartbeat WHERE id = 1")
+        .fetch_one(&db.pool)
+        .await
+        .expect("read token before probe");
+
+    let writer = begin_replica_floor_locked_writer(&db).await;
+
+    let probe_pool = db.pool.clone();
+    let probe_fence = std::sync::Arc::clone(db.fence());
+    let mut probing = tokio::spawn(async move {
+        crate::replica_fence::probe_once(&probe_pool, probe_fence.as_ref()).await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut probing)
+            .await
+            .is_err(),
+        "probe must wait for the exclusive floor lock while compliant writer is open"
+    );
+
+    writer
+        .rollback()
+        .await
+        .expect("release shared floor writer");
+    let entry = tokio::time::timeout(std::time::Duration::from_secs(5), probing)
+        .await
+        .expect("probe must complete after writer release")
+        .expect("probe task")
+        .expect("probe succeeds");
+
+    assert_eq!(
+        entry.token,
+        token_before + 1,
+        "existing handshake must publish one token via probe_once"
+    );
+    assert_eq!(
+        db.fence().verified_through(),
+        Some(entry.fence_wall),
+        "probe entry must be retained in the in-memory fence ring"
+    );
+
+    db.pool.close().await;
+    drop_scratch_db(&admin, seed_pool, &name).await;
 }
 
 /// `spawn_fence_probe` must verify the floor guard before letting the

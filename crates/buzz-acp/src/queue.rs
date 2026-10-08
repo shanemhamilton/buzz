@@ -15,6 +15,7 @@
 
 use nostr::{Event, ToBech32};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -155,6 +156,86 @@ impl BatchEvent {
     pub fn routing_thread_tags(&self) -> ThreadTags {
         routing_thread_tags(&self.event, self.edit.as_ref())
     }
+
+    /// See [`reply_thread`].
+    pub fn reply_thread(&self) -> String {
+        reply_thread(&self.event, self.edit.as_ref())
+    }
+
+    /// See [`ReplyRoute`].
+    pub fn reply_route(&self) -> ReplyRoute {
+        ReplyRoute {
+            root_event_id: self
+                .routing_thread_tags()
+                .root_event_id
+                .map(|root| root.to_ascii_lowercase()),
+            thread: self.reply_thread(),
+        }
+    }
+}
+
+/// Where a turn's `<context>` sends ordinary replies, as far as the
+/// native-steer guard needs to know.
+///
+/// A native steer adds a message to a running turn without a new `<context>`,
+/// so the turn keeps replying where its own `<context>` points. A message may
+/// be steered natively only when that destination is also right for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyRoute {
+    /// Routed thread root, lowercase; `None` for a top-level message.
+    root_event_id: Option<String>,
+    /// See [`reply_thread`].
+    thread: String,
+}
+
+impl ReplyRoute {
+    /// Whether a turn whose `<context>` was rendered for `self` also replies
+    /// correctly to `incoming`.
+    ///
+    /// In a channel, a top-level message is answered in a new thread rooted at
+    /// that message, so two messages share a destination only when they share
+    /// a [`reply_thread`]. In a DM, a top-level message's `<context>` names no
+    /// reply target (see `format_prompt`): every top-level DM message replies
+    /// at the top of the same conversation. DM messages therefore share a
+    /// destination when they share a thread root, including none.
+    pub fn accepts_steer(&self, incoming: &ReplyRoute, is_dm: bool) -> bool {
+        if is_dm {
+            self.root_event_id == incoming.root_event_id
+        } else {
+            self.thread == incoming.thread
+        }
+    }
+}
+
+/// Whether the running turn's prompt rendered its channel as a DM.
+///
+/// The prompt task records this when it formats the turn's `<context>`
+/// (`format_prompt`'s `is_dm`). The steer guard reads the recorded value
+/// instead of classifying the incoming event again: channel metadata can
+/// become resolvable after the turn starts, and the guard must apply the rule
+/// that matches the `<context>` the agent actually received.
+#[derive(Debug, Clone, Default)]
+pub struct PromptDmClassification(Arc<OnceLock<bool>>);
+
+impl PromptDmClassification {
+    /// Record the prompt's classification. Later calls are ignored: a turn has
+    /// one `<context>`.
+    pub fn record(&self, is_dm: bool) {
+        let _ = self.0.set(is_dm);
+    }
+
+    /// The recorded classification; `None` before the prompt is formatted.
+    pub fn get(&self) -> Option<bool> {
+        self.0.get().copied()
+    }
+}
+
+/// Reply destination of an in-flight turn, and how its prompt classified the
+/// channel.
+#[derive(Debug, Clone)]
+struct InFlightReplyRoute {
+    route: ReplyRoute,
+    prompt_is_dm: PromptDmClassification,
 }
 
 /// Why a batch's prior turn was cancelled — controls how `format_prompt`
@@ -248,6 +329,9 @@ pub struct EventQueue {
     in_flight_deadlines: HashMap<SessionScope, Instant>,
     /// Number of events in each in-flight batch (for expiry logging).
     in_flight_batch_sizes: HashMap<SessionScope, usize>,
+    /// Reply route of each in-flight turn: the [`ReplyRoute`] of the batch
+    /// event whose `<context>` routes the turn's replies (its last event).
+    in_flight_reply_routes: HashMap<SessionScope, InFlightReplyRoute>,
     retry_after: HashMap<SessionScope, Instant>,
     /// Per-scope retry attempt counter for exponential backoff / dead-lettering.
     retry_counts: HashMap<SessionScope, u32>,
@@ -317,6 +401,7 @@ impl EventQueue {
             in_flight_scopes: HashSet::new(),
             in_flight_deadlines: HashMap::new(),
             in_flight_batch_sizes: HashMap::new(),
+            in_flight_reply_routes: HashMap::new(),
             retry_after: HashMap::new(),
             retry_counts: HashMap::new(),
             quarantined_batches: HashMap::new(),
@@ -469,6 +554,7 @@ impl EventQueue {
             );
             self.in_flight_scopes.remove(&scope);
             self.in_flight_deadlines.remove(&scope);
+            self.in_flight_reply_routes.remove(&scope);
             // Recover any withheld goose-native steer events for the expired
             // scope back to the queue front so normal dispatch delivers
             // them. Unlike the in-flight batch above (already delivered to a
@@ -588,6 +674,7 @@ impl EventQueue {
                     .insert(scope.clone(), now + self.in_flight_deadline);
                 self.in_flight_batch_sizes
                     .insert(scope.clone(), cancelled.len());
+                self.record_in_flight_reply_route(&scope, &cancelled);
                 return Some(FlushBatch {
                     channel_id: scope.channel_id(),
                     scope,
@@ -622,6 +709,7 @@ impl EventQueue {
             .insert(scope.clone(), now + self.in_flight_deadline);
         self.in_flight_batch_sizes
             .insert(scope.clone(), events.len());
+        self.record_in_flight_reply_route(&scope, &events);
 
         // Merge any cancelled events stored by requeue_as_cancelled().
         // Fresh queued traffic means this scope is healthy enough to start a
@@ -644,6 +732,29 @@ impl EventQueue {
         })
     }
 
+    /// Earliest retry throttle for queued work not already in flight.
+    ///
+    /// Includes expired deadlines: an event-loop iteration can cross eligibility
+    /// before it arms its timer. The caller must gate on idle pool capacity and
+    /// dispatch when woken. Dispatch either makes the scope in-flight or releases
+    /// it with `mark_complete`, which clears the expired throttle even when a
+    /// busy session owner holds the batch. Empty/removed scopes never arm a timer.
+    pub fn next_retry_deadline(&self) -> Option<Instant> {
+        if self.nonretryable_dispatch_paused {
+            return None;
+        }
+        self.retry_after
+            .iter()
+            .filter(|(scope, _)| {
+                !self.in_flight_scopes.contains(*scope)
+                    && !self.quarantined_batches.contains_key(*scope)
+                    && (self.queues.get(*scope).is_some_and(|q| !q.is_empty())
+                        || self.cancelled_batches.contains_key(*scope))
+            })
+            .map(|(_, &deadline)| deadline)
+            .min()
+    }
+
     /// Mark the prompt for `channel_id` as complete.
     ///
     /// Removes the channel from `in_flight_channels` and `in_flight_deadlines`.
@@ -659,6 +770,7 @@ impl EventQueue {
         self.in_flight_scopes.remove(&scope);
         self.in_flight_deadlines.remove(&scope);
         self.in_flight_batch_sizes.remove(&scope);
+        self.in_flight_reply_routes.remove(&scope);
         // A cancelled batch that failed again is placed back in
         // `cancelled_batches` before completion. Keep its redispatch budget;
         // otherwise a healthy completion starts a new episode.
@@ -1023,6 +1135,7 @@ impl EventQueue {
             );
             self.in_flight_scopes.remove(&scope);
             self.in_flight_deadlines.remove(&scope);
+            self.in_flight_reply_routes.remove(&scope);
             // Symmetric with the flush_next expiry block: recover withheld
             // goose-native steer events for the expired scope so they are
             // not permanently orphaned in the side table.
@@ -1227,6 +1340,62 @@ impl EventQueue {
     /// treated as its conversation scope).
     pub fn is_scope_in_flight<K: IntoScope>(&self, scope: K) -> bool {
         self.in_flight_scopes.contains(&scope.into_scope())
+    }
+
+    /// Whether a message with reply route `incoming` may be steered natively
+    /// into the turn in flight for `scope`.
+    ///
+    /// A message whose route the running turn does not accept (see
+    /// [`ReplyRoute::accepts_steer`]; possible whenever one session spans
+    /// several reply destinations: the channel session policy, or a DM) must
+    /// not be steered natively; the cancel+merge path re-dispatches it with
+    /// its own full `<context>`.
+    ///
+    /// The rule follows how the running turn's prompt classified the channel
+    /// (see [`PromptDmClassification`]). Until the prompt task records that,
+    /// `channel_is_dm` is the listener's own classification, where unresolved
+    /// metadata counts as a DM. A channel the listener knows is not a DM also
+    /// renders as one in the prompt, so the channel rule applies at once.
+    /// Otherwise the prompt may render either way, and the answer is `false`.
+    pub fn in_flight_accepts_steer(
+        &self,
+        scope: &SessionScope,
+        incoming: &ReplyRoute,
+        channel_is_dm: bool,
+    ) -> bool {
+        let Some(running) = self.in_flight_reply_routes.get(scope) else {
+            return false;
+        };
+        match running.prompt_is_dm.get() {
+            Some(is_dm) => running.route.accepts_steer(incoming, is_dm),
+            None if !channel_is_dm => running.route.accepts_steer(incoming, false),
+            None => false,
+        }
+    }
+
+    /// The cell in which the prompt task for `scope`'s in-flight turn records
+    /// its DM classification (see [`PromptDmClassification`]).
+    pub fn in_flight_prompt_dm(&self, scope: &SessionScope) -> Option<PromptDmClassification> {
+        self.in_flight_reply_routes
+            .get(scope)
+            .map(|running| running.prompt_is_dm.clone())
+    }
+
+    fn record_in_flight_reply_route(&mut self, scope: &SessionScope, events: &[BatchEvent]) {
+        match events.last() {
+            Some(last) => {
+                self.in_flight_reply_routes.insert(
+                    scope.clone(),
+                    InFlightReplyRoute {
+                        route: last.reply_route(),
+                        prompt_is_dm: PromptDmClassification::default(),
+                    },
+                );
+            }
+            None => {
+                self.in_flight_reply_routes.remove(scope);
+            }
+        }
     }
 
     /// Whether any scope currently has a turn in flight.
@@ -1479,6 +1648,19 @@ pub fn edit_target_id(event: &Event) -> Option<String> {
 /// message. This holds even when fetching the original failed.
 pub(crate) fn reaction_target_id(event: &Event) -> String {
     edit_target_id(event).unwrap_or_else(|| event.id.to_hex())
+}
+
+/// The thread that replies to `event` belong to: its routed thread root, or
+/// the routed event itself when it is top-level (a reply opens a thread
+/// rooted there). Lowercase, so equivalent hex spellings compare equal.
+///
+/// This is the thread-session key. Outside DMs it also decides whether a
+/// message may be steered natively into a running turn (see [`ReplyRoute`]).
+pub(crate) fn reply_thread(event: &Event, edit: Option<&ResolvedEdit>) -> String {
+    routing_thread_tags(event, edit)
+        .root_event_id
+        .unwrap_or_else(|| reaction_target_id(event))
+        .to_ascii_lowercase()
 }
 
 /// Thread tags that route replies for `event`. See
@@ -2476,6 +2658,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     //   - top-level     → anchor to the triggering event (it becomes the root)
     // Agent↔agent turns get no forced anchor — deep nesting is intentional
     // there. DMs are always 1:1 with a human, so they always anchor.
+    // `ReplyRoute::accepts_steer` mirrors this DM rule; keep them in sync.
     let sender_pubkey = last_event.event.pubkey.to_hex();
     let reply_anchor = if is_dm {
         thread_tags
@@ -2653,10 +2836,165 @@ pub(crate) fn native_steer_framing() -> (&'static str, &'static str) {
 }
 
 #[cfg(test)]
+mod reply_route_tests {
+    use super::ReplyRoute;
+
+    fn route(root: Option<&str>, thread: &str) -> ReplyRoute {
+        ReplyRoute {
+            root_event_id: root.map(str::to_string),
+            thread: thread.to_string(),
+        }
+    }
+
+    /// A top-level message (no root) whose replies open thread `id`.
+    fn top_level(id: &str) -> ReplyRoute {
+        route(None, id)
+    }
+
+    /// A reply in the thread rooted at `root`.
+    fn in_thread(root: &str) -> ReplyRoute {
+        route(Some(root), root)
+    }
+
+    #[test]
+    fn channel_steers_only_within_one_reply_thread() {
+        assert!(in_thread("a").accepts_steer(&in_thread("a"), false));
+        assert!(!in_thread("a").accepts_steer(&in_thread("b"), false));
+        // Replies to a top-level message open a thread rooted at it.
+        assert!(top_level("a").accepts_steer(&in_thread("a"), false));
+        assert!(in_thread("a").accepts_steer(&top_level("a"), false));
+        assert!(!top_level("a").accepts_steer(&top_level("b"), false));
+        assert!(!top_level("a").accepts_steer(&in_thread("b"), false));
+    }
+
+    #[test]
+    fn dm_steers_within_one_thread_or_the_top_level() {
+        // Every top-level DM message replies at the top of the conversation.
+        assert!(top_level("a").accepts_steer(&top_level("b"), true));
+        assert!(in_thread("a").accepts_steer(&in_thread("a"), true));
+        assert!(!in_thread("a").accepts_steer(&in_thread("b"), true));
+        // A top-level DM turn has no `--reply-to`; a threaded one does.
+        assert!(!top_level("a").accepts_steer(&in_thread("a"), true));
+        assert!(!in_thread("a").accepts_steer(&top_level("b"), true));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use nostr::{EventBuilder, Keys, Kind, Timestamp};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn retry_wake_redelivers_before_and_after_replacement_eligibility() {
+        use crate::recovery_wake::{wait, RecoveryWake};
+        for replacement_first in [true, false] {
+            let mut queue = EventQueue::new(DedupMode::Queue);
+            let channel = Uuid::new_v4();
+            let event = make_queued(channel, "original batch");
+            let id = event.event.id;
+            let received_at = event.received_at;
+            queue.push(event);
+            let batch = queue.flush_next().unwrap();
+            assert!(queue.requeue(batch).is_none());
+            queue.mark_complete(channel);
+            // Production requeue installs a future throttle, not an immediate
+            // dispatch. Accelerate only the test's clock boundary.
+            assert!(queue.next_retry_deadline().unwrap() > Instant::now());
+            let deadline = if replacement_first {
+                Instant::now() + Duration::from_millis(30)
+            } else {
+                Instant::now() - Duration::from_millis(30)
+            };
+            queue.retry_after.insert(conv(channel), deadline);
+            let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+            tx.send(crate::RespawnResult {
+                index: 0,
+                result: Err(anyhow::anyhow!("wake token")),
+            })
+            .await
+            .unwrap();
+            // With no idle agent the event loop disables the retry timer,
+            // even if its deadline is already past. Respawn is the wake owner.
+            assert!(matches!(
+                wait(&mut rx, None, None).await,
+                RecoveryWake::Respawn(_)
+            ));
+            if replacement_first {
+                assert!(
+                    queue.flush_next().is_none(),
+                    "respawn must not bypass backoff"
+                );
+            }
+            assert!(matches!(
+                wait(&mut rx, queue.next_retry_deadline(), None).await,
+                RecoveryWake::Retry
+            ));
+            let retried = queue.flush_next().unwrap();
+            assert_eq!(retried.events.len(), 1);
+            assert_eq!(retried.events[0].event.id, id);
+            assert_eq!(retried.events[0].received_at, received_at);
+            assert_eq!(
+                queue.next_retry_deadline(),
+                None,
+                "in-flight work cannot hot-loop"
+            );
+            queue.mark_complete(channel);
+            assert!(
+                queue.flush_next().is_none(),
+                "completed work must not duplicate"
+            );
+            assert_eq!(queue.next_retry_deadline(), None);
+            assert!(tokio::time::timeout(
+                Duration::from_millis(20),
+                wait(&mut rx, queue.next_retry_deadline(), None)
+            )
+            .await
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn retry_deadline_excludes_empty_removed_and_held_scopes() {
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let channel = Uuid::new_v4();
+        let past = Instant::now() - Duration::from_secs(1);
+        queue.retry_after.insert(conv(channel), past);
+        assert_eq!(queue.next_retry_deadline(), None);
+        queue.push(make_queued(channel, "held"));
+        assert_eq!(queue.next_retry_deadline(), Some(past));
+        let quarantined_scope = conv(channel);
+        queue.quarantined_batches.insert(
+            quarantined_scope.clone(),
+            FlushBatch {
+                channel_id: channel,
+                scope: quarantined_scope.clone(),
+                events: vec![],
+                cancelled_events: vec![],
+                cancel_reason: None,
+            },
+        );
+        assert_eq!(queue.next_retry_deadline(), None);
+        queue.quarantined_batches.remove(&quarantined_scope);
+        assert_eq!(queue.next_retry_deadline(), Some(past));
+        let held = queue.flush_next().unwrap();
+        assert_eq!(queue.next_retry_deadline(), None);
+        // This is dispatch_pending's busy-owner / no-slot release path.
+        queue.requeue_preserve_timestamps(held);
+        queue.mark_complete(channel);
+        assert_eq!(queue.next_retry_deadline(), None);
+        queue.retry_after.insert(conv(channel), past);
+        queue.drain_channel(channel);
+        assert_eq!(queue.next_retry_deadline(), None);
+
+        let mut paused = EventQueue::new(DedupMode::Queue);
+        let paused_channel = Uuid::new_v4();
+        paused.push(make_queued(paused_channel, "paused"));
+        paused.retry_after.insert(conv(paused_channel), past);
+        assert_eq!(paused.next_retry_deadline(), Some(past));
+        paused.pause_nonretryable_dispatch("provider configuration rejected".into());
+        assert_eq!(paused.next_retry_deadline(), None);
+    }
 
     /// Build a test event with the given content and kind.
     fn make_event(content: &str) -> Event {
@@ -5696,6 +6034,10 @@ mod tests {
             q.flush_next().is_none(),
             "third redispatch must wait for backoff"
         );
+        assert!(
+            q.next_retry_deadline().is_some(),
+            "cancelled-only work must arm quiet-host recovery"
+        );
         q.retry_after
             .insert(conv(ch), Instant::now() - Duration::from_secs(1));
 
@@ -5725,6 +6067,41 @@ mod tests {
         assert!(!q.cancelled_batches.contains_key(&conv(ch)));
         assert!(!q.retry_after.contains_key(&conv(ch)));
         assert!(!q.cancelled_redispatch_counts.contains_key(&conv(ch)));
+    }
+
+    #[tokio::test]
+    async fn cancelled_only_backoff_wakes_quiet_host_for_redispatch() {
+        use crate::recovery_wake::{wait, RecoveryWake};
+
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        q.push(make_queued(ch, "quiet-host-seed"));
+        let batch = q.flush_next().expect("initial flush");
+        q.requeue_as_cancelled(batch, CancelReason::Steer);
+        q.mark_complete(ch);
+
+        let first = q.flush_next().expect("first fallback flush");
+        q.requeue_as_cancelled(first, CancelReason::Steer);
+        q.mark_complete(ch);
+        let second = q.flush_next().expect("second fallback flush");
+        q.requeue_as_cancelled(second, CancelReason::Steer);
+        q.mark_complete(ch);
+        assert!(q.flush_next().is_none(), "backoff holds cancelled work");
+
+        q.retry_after
+            .insert(conv(ch), Instant::now() + Duration::from_millis(20));
+        let (_tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let wake = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait(&mut rx, q.next_retry_deadline(), None),
+        )
+        .await
+        .expect("cancelled-only retry deadline must wake a quiet host");
+        assert!(matches!(wake, RecoveryWake::Retry));
+        assert!(
+            q.flush_next().is_some(),
+            "the timer wake makes cancelled-only work dispatchable"
+        );
     }
 
     #[test]

@@ -110,6 +110,10 @@ run_unit_tests() {
   run_test_step "buzz-acp tests" \
     cargo test -p buzz-acp -- --nocapture
 
+  # Keep MCP lifecycle coverage in step with the nextest path.
+  run_test_step "buzz-dev-mcp tests" \
+    cargo test -p buzz-dev-mcp -- --nocapture
+
 
   # buzz-db migrator/lint unit tests (no infra): guard the embedded-migrator
   # invariant (exactly the consolidated 0001; cutover/backfill stays an operator
@@ -119,6 +123,8 @@ run_unit_tests() {
   # separate isolated-DB gate, so --lib keeps this step infra-free.
   run_test_step "buzz-db unit tests" \
     cargo test -p buzz-db --lib -- --nocapture
+  run_test_step "buzz-db source-policy tests" \
+    cargo test -p buzz-db --test observability_source -- --nocapture
 
   run_test_step "buzz-media storage snapshot serialization test" \
     cargo test -p buzz-media --lib bucket_index::tests::bucket_snapshot_json_round_trip_preserves_community_keys -- --exact --nocapture
@@ -191,6 +197,12 @@ run_unit_tests() {
   run_test_step "buzz-relay NIP-FI session tests" \
     cargo test -p buzz-relay --lib nip_fi_session::tests:: -- --nocapture
 
+  run_test_step "buzz-relay NIP-FI shadow recorder tests" \
+    cargo test -p buzz-relay --lib nip_fi_shadow::tests:: -- --nocapture
+
+  run_test_step "buzz-relay NIP-FI shadow session tests" \
+    cargo test -p buzz-relay --lib nip_fi_shadow_session::tests:: -- --nocapture
+
   # Mirror the NIP-FI (S3) stanza from `just test-unit`: module filters, then
   # each exact name. Keep this list in step with that stanza's `test(=...)`s.
   run_test_step "buzz-relay NIP-FI config tests" \
@@ -218,6 +230,9 @@ run_unit_tests() {
 
   run_test_step "buzz-relay router tests" \
     cargo test -p buzz-relay --lib router::tests:: -- --nocapture
+
+  run_test_step "buzz-relay NIP-FI shared core tests" \
+    cargo test -p buzz-relay --lib nip_fi_core::tests:: -- --nocapture
 
   run_test_step "buzz-relay NIP-FI HTTP ingress tests" \
     cargo test -p buzz-relay --lib nip_fi_http::tests:: -- --nocapture
@@ -260,8 +275,12 @@ run_unit_tests() {
     handlers::auth::tests::fi_root_authorization_denied_rows_emit_identical_frames
     handlers::auth::tests::fi_invalid_nip42_proof_emits_terminal_evidence_rejected
     handlers::auth::tests::handle_auth_pairing_mismatch_runs_full_root_denial_path
+    handlers::auth::tests::shadow_root_auth_records_pairing_denial
+    handlers::auth::tests::shadow_root_invalid_nip42_retires_without_record
     handlers::auth::tests::nip42_denial_class_separates_internal_failure_from_bad_evidence
-    handlers::event::tests::p1b_agent_observer_event_barrier_expiry_blocks_fanout_and_ack
+    handlers::event::tests::fanout_access::owner_only_kinds_keep_only_the_owner
+    handlers::event::tests::pubsub_fanout::pubsub_owner_only_kinds_reach_only_the_owner
+    handlers::event::tests::pubsub_fanout::dispatch_owner_only_kinds_reach_only_the_owner
     handlers::req::tests::p1a_huddle_liveness_req_barrier_expiry_blocks_query_and_emission
     state::tests::f3_cancellation_during_check_terminates_socket_without_waiting_for_check
     state::tests::on_not_run_runs_once_on_each_deny_arm_and_never_on_admit

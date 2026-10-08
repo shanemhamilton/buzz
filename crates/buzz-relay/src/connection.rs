@@ -353,12 +353,13 @@ pub(crate) fn compute_session_deadline(
 
 /// Acquires a connection semaphore permit, sends the NIP-42 AUTH challenge,
 /// then drives the send, heartbeat, and receive loops until the connection closes.
-pub async fn handle_connection(
+pub(crate) async fn handle_connection(
     socket: WebSocket,
     state: Arc<AppState>,
     addr: SocketAddr,
     tenant: TenantContext,
     nip_fi_assertion: Option<buzz_auth::VerifiedAssertion>,
+    nip_fi_shadow: Option<Arc<crate::nip_fi_shadow_session::ShadowSession>>,
     connection_time: chrono::DateTime<chrono::Utc>,
 ) {
     let conn_id = Uuid::new_v4();
@@ -383,6 +384,7 @@ pub async fn handle_connection(
     };
     let (pre_terminal_ctrl_tx, pre_terminal_ctrl_rx) = mpsc::channel::<WsMessage>(1);
     let control = CommunityConnectionControl::new(cancel);
+    control.attach_nip_fi_shadow(nip_fi_shadow);
     let drain_reason = control.disconnect_reason();
     let pre_expiry_task = pre_session_deadline.map(|deadline| {
         crate::nip_fi_session::spawn_nip_fi_expiry_task(
@@ -757,11 +759,10 @@ async fn handle_active_connection(
     crate::handlers::close::release_connection_subscriptions(&conn, &state).await;
     state.conn_manager.deregister(conn.conn_id);
     if let Some(auth_ctx) = authenticated {
-        let remaining = state.conn_manager.connection_ids_for_pubkey_in_community(
+        if !state.conn_manager.has_admitted_connection(
             conn.tenant.community(),
             auth_ctx.pubkey.to_bytes().as_slice(),
-        );
-        if remaining.is_empty() {
+        ) {
             let _ = state
                 .pubsub
                 .clear_presence(&conn.tenant, &auth_ctx.pubkey)
@@ -1315,16 +1316,32 @@ pub(crate) mod tests {
     use tokio::sync::Notify;
     use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-    /// A connection whose outbound frames a test can read back.
+    /// A test connection together with the receiving end of each outbound queue.
+    pub(crate) struct TestConn {
+        /// The connection under test.
+        pub(crate) conn: Arc<ConnectionState>,
+        /// Receives data frames (EVENT, NOTICE, OK, ...).
+        pub(crate) send_rx: mpsc::Receiver<WsMessage>,
+        /// Receives control frames; capacity 8, as in production.
+        pub(crate) ctrl_rx: mpsc::Receiver<WsMessage>,
+        /// Receives the terminal NIP-FI denial frame; capacity 1, as in production.
+        pub(crate) terminal_rx: mpsc::Receiver<WsMessage>,
+    }
+
+    /// Builds a connection in `auth` carrying the NIP-FI assertion presented at
+    /// upgrade, if any. The admission gate is off-mode and no session deadline
+    /// is set.
     ///
     /// Lives here, next to `ConnectionState`, so the crate has one place that
-    /// knows how to build one. Shared with `crate::rejection`'s tests.
-    pub(crate) fn test_conn_with_auth(
+    /// knows how to build one. Shared with `crate::rejection`'s and
+    /// `crate::nip_fi_session`'s tests.
+    pub(crate) fn test_conn(
         auth: AuthState,
-    ) -> (Arc<ConnectionState>, mpsc::Receiver<WsMessage>) {
+        nip_fi_assertion: Option<buzz_auth::VerifiedAssertion>,
+    ) -> TestConn {
         let (send_tx, send_rx) = mpsc::channel(4);
-        let (ctrl_tx, _ctrl_rx) = mpsc::channel(4);
-        let (terminal_ctrl_tx, _terminal_ctrl_rx) = mpsc::channel(1);
+        let (ctrl_tx, ctrl_rx) = mpsc::channel(8);
+        let (terminal_ctrl_tx, terminal_rx) = mpsc::channel(1);
         let cancel = CancellationToken::new();
         let conn = ConnectionState {
             conn_id: Uuid::new_v4(),
@@ -1341,12 +1358,26 @@ pub(crate) mod tests {
             cancel: cancel.clone(),
             backpressure_count: Arc::new(AtomicU8::new(0)),
             grace_limit: 3,
-            nip_fi_assertion: None,
+            nip_fi_assertion,
             session_deadline: None,
             nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(cancel.clone()),
             community_control: crate::state::CommunityConnectionControl::new(cancel.clone()),
         };
-        (Arc::new(conn), send_rx)
+        TestConn {
+            conn: Arc::new(conn),
+            send_rx,
+            ctrl_rx,
+            terminal_rx,
+        }
+    }
+
+    /// A connection without a NIP-FI assertion whose data frames a test can
+    /// read back.
+    pub(crate) fn test_conn_with_auth(
+        auth: AuthState,
+    ) -> (Arc<ConnectionState>, mpsc::Receiver<WsMessage>) {
+        let TestConn { conn, send_rx, .. } = test_conn(auth, None);
+        (conn, send_rx)
     }
 
     /// An authenticated connection — the only state admission quotas apply to.
@@ -1364,7 +1395,8 @@ pub(crate) mod tests {
         }
     }
 
-    fn pending_state() -> AuthState {
+    /// A connection awaiting its NIP-42 AUTH response.
+    pub(crate) fn pending_state() -> AuthState {
         AuthState::Pending {
             challenge: "test-challenge".to_owned(),
             started_at: Instant::now(),
@@ -3073,6 +3105,7 @@ pub(crate) mod tests {
                                     "127.0.0.1:9999".parse().unwrap(),
                                     tenant_i,
                                     Some(assertion_i),
+                                    None,
                                     conn_time,
                                 )
                                 .await

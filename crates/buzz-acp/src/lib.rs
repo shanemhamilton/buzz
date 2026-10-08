@@ -16,6 +16,7 @@ mod pool_lifecycle;
 mod prompt_framing;
 mod prompt_project;
 mod queue;
+mod recovery_wake;
 mod relay;
 mod run_task;
 mod runtime;
@@ -34,7 +35,6 @@ use acp::{AcpClient, EnvVar, McpServer};
 use anyhow::{ensure, Context, Result};
 use buzz_core::kind::{
     KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE,
-    KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
 };
 use buzz_core::observer::{
     decrypt_observer_payload, encrypt_observer_payload, OBSERVER_FRAME_TELEMETRY,
@@ -632,8 +632,12 @@ struct QueuedNormalListenerEvent {
     /// Visible message that owns this event's lifecycle reactions: the
     /// original for an edit, otherwise the event itself.
     reaction_target_id: String,
-    event_for_steer: nostr::Event,
-    prompt_tag_for_steer: String,
+    /// The admitted event as a native steer would render it, including an
+    /// edit's resolved original-message routing.
+    steer_event: queue::BatchEvent,
+    /// The listener's DM classification of the channel (unresolved counts as
+    /// a DM); see [`EventQueue::in_flight_accepts_steer`].
+    channel_is_dm: bool,
     pending_nonretryable_notice: Option<PendingNonretryableNotice>,
 }
 
@@ -667,8 +671,8 @@ impl QueuedNormalListenerEvent {
             scope: self.scope.clone(),
             events: vec![queue::BatchEvent {
                 edit,
-                event: self.event_for_steer.clone(),
-                prompt_tag: self.prompt_tag_for_steer.clone(),
+                event: self.steer_event.event.clone(),
+                prompt_tag: self.steer_event.prompt_tag.clone(),
                 received_at: std::time::Instant::now(),
             }],
             cancelled_events: vec![],
@@ -694,17 +698,24 @@ impl QueuedNormalListenerEvent {
         let Some(signal) = mode_gate_signal(handling, &self.effective_author, owner) else {
             return;
         };
-        // Edits take the universal cancel+merge path: a native steer body does
-        // not yet carry the edit's original-message routing, whereas a
-        // requeued edit is re-dispatched as its own routed batch.
+        // A native steer keeps the running turn's `<context>`, so it may only
+        // carry a message that replies in the same place. A channel-policy or
+        // DM session spans several destinations; a message for another one
+        // takes the cancel+merge path, whose re-prompt carries its own
+        // `<context>`. The DM rule applies only when the running turn's
+        // prompt itself was rendered as a DM.
+        let same_reply_route = queue.in_flight_accepts_steer(
+            &self.scope,
+            &self.steer_event.reply_route(),
+            self.channel_is_dm,
+        );
         let native_attempted = matches!(signal, ControlSignal::Steer)
-            && queue::edit_target_id(&self.event_for_steer).is_none()
+            && same_reply_route
             && try_native_steer(
                 pool,
                 queue,
                 self.scope.clone(),
-                self.event_for_steer,
-                self.prompt_tag_for_steer,
+                self.steer_event,
                 steer_ack_tx,
             );
         if !native_attempted {
@@ -743,6 +754,7 @@ impl NormalListenerIngress {
         self,
         queue: &mut EventQueue,
         session_scope: scope::SessionScope,
+        channel_is_dm: bool,
     ) -> QueuedNormalListenerEvent {
         let Self {
             buzz_event,
@@ -751,10 +763,14 @@ impl NormalListenerIngress {
             edit,
         } = self;
         let reaction_target_id = queue::reaction_target_id(&buzz_event.event);
-        let event_for_steer = buzz_event.event.clone();
-        let prompt_tag_for_steer = prompt_tag.clone();
-        let channel_id = buzz_event.channel_id;
         let received_at = std::time::Instant::now();
+        let steer_event = queue::BatchEvent {
+            event: buzz_event.event.clone(),
+            prompt_tag: prompt_tag.clone(),
+            received_at,
+            edit: edit.clone(),
+        };
+        let channel_id = buzz_event.channel_id;
         // Resolved edit routing is needed only if a heartbeat left a notice
         // pending. Clone before the event enters the queue so the notice can
         // retain the same routing context without removing the request.
@@ -783,8 +799,8 @@ impl NormalListenerIngress {
             scope: session_scope,
             effective_author,
             reaction_target_id,
-            event_for_steer,
-            prompt_tag_for_steer,
+            steer_event,
+            channel_is_dm,
             pending_nonretryable_notice,
         }
     }
@@ -3035,42 +3051,7 @@ async fn run_harness(
     tracing::info!("discovered {} channel(s)", channel_info_map.len());
     let channel_ids: Vec<Uuid> = channel_info_map.keys().copied().collect();
 
-    let rules: Vec<SubscriptionRule> = match config.subscribe_mode {
-        SubscribeMode::Mentions => {
-            vec![SubscriptionRule {
-                name: "mentions".into(),
-                channels: filter::ChannelScope::All("all".into()),
-                kinds: config.kinds_override.clone().unwrap_or_else(|| {
-                    vec![
-                        KIND_STREAM_MESSAGE,
-                        KIND_WORKFLOW_APPROVAL_REQUESTED,
-                        KIND_STREAM_REMINDER,
-                    ]
-                }),
-                require_mention: !config.no_mention_filter,
-                filter: None,
-                compiled_filter: None,
-                consecutive_timeouts: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
-                prompt_tag: Some("@mention".into()),
-            }]
-        }
-        SubscribeMode::All => {
-            vec![SubscriptionRule {
-                name: "all".into(),
-                channels: filter::ChannelScope::All("all".into()),
-                kinds: config.kinds_override.clone().unwrap_or_default(),
-                require_mention: false,
-                filter: None,
-                compiled_filter: None,
-                consecutive_timeouts: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
-                prompt_tag: Some("all".into()),
-            }]
-        }
-        SubscribeMode::Config => {
-            // load_rules() already warns if the config file has zero rules.
-            config::load_rules(&config.config_path)?
-        }
-    };
+    let rules = startup_subscription_rules(config)?;
 
     let channel_filters = config::resolve_channel_filters(config, &channel_ids, &rules);
     if channel_filters.is_empty() {
@@ -3295,6 +3276,7 @@ async fn run_harness(
         SteerAck(SteerAckEvent),
         Wake(u32, Result<AgentPool, String>),
         HoldDeadline,
+        Recovery(recovery_wake::RecoveryWake),
     }
 
     loop {
@@ -3380,12 +3362,8 @@ async fn run_harness(
             }
         }
 
-        let mut respawn_collected = false;
-        while let Ok(rr) = respawn_rx.try_recv() {
-            respawn_collected |= complete_respawn_result(&mut pool, &mut crash_history, rr, config);
-        }
         // Reap completed respawn handles from the JoinSet. Payloads are
-        // delivered out-of-band through `respawn_rx` (drained above), so the
+        // delivered out-of-band through `respawn_rx` (selected below), so the
         // JoinSet is never joined by the normal flow — Tokio retains finished
         // tasks until `join_next`, so without this the set grows on every
         // refill/crash recovery and `!respawn_tasks.is_empty()` would stay true
@@ -3395,20 +3373,15 @@ async fn run_harness(
         // slot's `respawn_in_flight` is cleared when its payload is received),
         // not JoinSet occupancy.
         while respawn_tasks.join_next().now_or_never().flatten().is_some() {}
-        // Flush requeued events that were waiting for a live agent. Without
-        // this, batches requeued during crash recovery sit idle until the
-        // next relay event arrives — which can be minutes on quiet channels.
-        if respawn_collected {
-            for (scope, thread_tags) in dispatch_pending(
-                &mut pool,
-                &mut queue,
-                &ctx,
-                &mut last_activity,
-                observer.as_ref(),
-            ) {
-                typing_channels.insert(scope, thread_tags);
-            }
-        }
+        // Retry deadlines are actionable only with idle capacity. A busy pool
+        // wakes on its result/respawn instead of spinning on an expired retry.
+        let retry_at = if pool_ready && pool.any_idle() {
+            queue.next_retry_deadline()
+        } else {
+            None
+        };
+        let maintenance_at =
+            pool_ready.then(|| (last_maintenance + maintenance_interval).into_std());
 
         // Borrow result_rx and join_set simultaneously via split-borrow helper.
         pool.retain_held_scopes(|scope| queue.has_pending_scope(scope));
@@ -3417,6 +3390,13 @@ async fn run_harness(
             let (result_rx, join_set) = pool.rx_and_join_set();
             tokio::select! {
                 biased;
+                _ = shutdown_rx.changed() => {
+                    tracing::info!("shutting down");
+                    break;
+                }
+                wake = recovery_wake::wait(&mut respawn_rx, retry_at, maintenance_at) => {
+                    Some(PoolEvent::Recovery(wake))
+                }
                 // recv() returning None means all senders dropped (pool was torn down).
                 // Break cleanly instead of panicking.
                 r = result_rx.recv(), if pool_ready => match r {
@@ -3815,14 +3795,13 @@ async fn run_harness(
                             // channel-keyed routing. Telemetry only for now —
                             // queue/pool partitioning by scope lands in a
                             // follow-up (see ticket outline steps 2–4).
-                            let session_scope = ingress.session_scope(
-                                config.session_policy,
-                                is_dm_channel(
-                                    ingress.buzz_event.channel_id,
-                                    &ctx.channel_info,
-                                )
-                                .await,
-                            );
+                            let channel_is_dm = is_dm_channel(
+                                ingress.buzz_event.channel_id,
+                                &ctx.channel_info,
+                            )
+                            .await;
+                            let session_scope =
+                                ingress.session_scope(config.session_policy, channel_is_dm);
                             tracing::debug!(
                                 channel_id = %session_scope.channel_id(),
                                 scope = %session_scope.telemetry_label(),
@@ -3831,7 +3810,8 @@ async fn run_harness(
                                 policy = %config.session_policy,
                                 "admitted event — resolved session scope"
                             );
-                            let mut queued = ingress.push(&mut queue, session_scope);
+                            let mut queued =
+                                ingress.push(&mut queue, session_scope, channel_is_dm);
                             // 👀 — immediate "seen" reaction, only if the event
                             // was actually queued (not dropped by DedupMode::Drop).
                             // Fire-and-forget: on rare fast-failure paths the
@@ -4014,14 +3994,29 @@ async fn run_harness(
                     }
                     None
                 }
-                _ = shutdown_rx.changed() => {
-                    tracing::info!("shutting down");
-                    break;
-                }
             }
         };
 
         match pool_event {
+            Some(PoolEvent::Recovery(wake)) => {
+                match wake {
+                    recovery_wake::RecoveryWake::Respawn(rr) => {
+                        complete_respawn_result(&mut pool, &mut crash_history, *rr, config);
+                    }
+                    // Maintenance runs at the top of the next iteration.
+                    recovery_wake::RecoveryWake::Maintenance => continue,
+                    recovery_wake::RecoveryWake::Retry => {}
+                }
+                for (scope, thread_tags) in dispatch_pending(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut last_activity,
+                    observer.as_ref(),
+                ) {
+                    typing_channels.insert(scope, thread_tags);
+                }
+            }
             Some(PoolEvent::Result(result)) => {
                 // Stop the typing indicator for the completed turn's exact scope,
                 // not the whole channel — a sibling thread still running in the
@@ -4593,8 +4588,7 @@ fn try_native_steer(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
     scope: scope::SessionScope,
-    event: nostr::Event,
-    prompt_tag: String,
+    be: queue::BatchEvent,
     steer_ack_tx: &mpsc::UnboundedSender<SteerAckEvent>,
 ) -> bool {
     let channel_id = scope.channel_id();
@@ -4611,22 +4605,12 @@ fn try_native_steer(
     // channel context and the actor's profile in the original prompt,
     // duplicating it here would defeat the point of non-cancelling
     // steering (which is to inject only what's new).
-    let (tag, closing) = queue::native_steer_framing();
-    let event_id_hex = event.id.to_hex();
-    let be = queue::BatchEvent {
-        event,
-        prompt_tag: prompt_tag.clone(),
-        received_at: std::time::Instant::now(),
-        edit: None,
-    };
-    let event_block = queue::format_event_block(channel_id, None, &be, None);
-    let new_message = prompt_framing::semantic_section(tag, "");
-    let event_section = prompt_framing::semantic_section_with_attributes(
-        "buzz-event",
-        &[("type", prompt_tag.as_str())],
-        &event_block,
-    );
-    let body = format!("{new_message}\n\n{event_section}\n\n{closing}");
+    // The caller steers natively only a message that replies where the
+    // running turn replies (`ReplyRoute::accepts_steer`), so the turn's own
+    // `<context>` still routes the reply. An edit's
+    // block names its original (`Edit of:`) and the original's thread root.
+    let event_id_hex = be.event.id.to_hex();
+    let body = native_steer_body(channel_id, &be);
 
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<pool::SteerAck>();
     let request = pool::SteerRequest {
@@ -4691,6 +4675,19 @@ fn try_native_steer(
             false
         }
     }
+}
+
+/// Render the prompt delta sent by [`try_native_steer`].
+fn native_steer_body(channel_id: Uuid, be: &queue::BatchEvent) -> String {
+    let (tag, closing) = queue::native_steer_framing();
+    let event_block = queue::format_event_block(channel_id, None, be, None);
+    let new_message = prompt_framing::semantic_section(tag, "");
+    let event_section = prompt_framing::semantic_section_with_attributes(
+        "buzz-event",
+        &[("type", be.prompt_tag.as_str())],
+        &event_block,
+    );
+    format!("{new_message}\n\n{event_section}\n\n{closing}")
 }
 
 // ── try_native_steer fallback-log tests ───────────────────────────────────────
@@ -4861,8 +4858,12 @@ mod try_native_steer_fallback_log_tests {
                 pool,
                 &mut queue,
                 busy_scope.clone(),
-                event,
-                "mention".into(),
+                queue::BatchEvent {
+                    event,
+                    prompt_tag: "mention".into(),
+                    received_at: std::time::Instant::now(),
+                    edit: None,
+                },
                 &steer_ack_tx,
             )
         });
@@ -5128,6 +5129,9 @@ fn dispatch_pending(
             .state
             .set_scope_owner_generation(scope.clone(), owner_generation);
 
+        // The prompt task records how it classified the channel, for the
+        // native-steer guard (`EventQueue::in_flight_accepts_steer`).
+        let prompt_dm = queue.in_flight_prompt_dm(&scope).unwrap_or_default();
         let abort_handle = pool.join_set.spawn(async move {
             pool::run_prompt_task(
                 agent,
@@ -5137,6 +5141,7 @@ fn dispatch_pending(
                 result_tx,
                 Some(control_rx),
                 task_turn_id,
+                prompt_dm,
             )
             .await;
         });
@@ -6005,6 +6010,7 @@ fn dispatch_heartbeat(
             result_tx,
             None,
             task_turn_id,
+            Default::default(),
         )
         .await;
     });
@@ -6614,16 +6620,20 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
         if !config_options.is_empty() {
             println!("Models (stable configOptions):");
             for opt in &config_options {
-                let config_id = opt.get("configId").and_then(|v| v.as_str()).unwrap_or("?");
+                let config_id = opt
+                    .get("id")
+                    .or_else(|| opt.get("configId"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
                 let display = opt
-                    .get("displayName")
+                    .get("name")
                     .and_then(|v| v.as_str())
                     .unwrap_or(config_id);
-                println!("  {display} (configId: {config_id})");
+                println!("  {display} (id: {config_id})");
                 if let Some(options) = opt.get("options").and_then(|v| v.as_array()) {
                     for o in options {
                         let val = o.get("value").and_then(|v| v.as_str()).unwrap_or("?");
-                        let name = o.get("displayName").and_then(|v| v.as_str()).unwrap_or(val);
+                        let name = o.get("name").and_then(|v| v.as_str()).unwrap_or(val);
                         println!("    - {name} (value: {val})");
                     }
                 }
@@ -10378,6 +10388,591 @@ mod build_mcp_servers_tests {
     }
 }
 
+/// Local admission rules for the normal listener. The relay subscription is
+/// derived separately (`config::resolve_channel_filters`); an event must pass
+/// both, so each default kind has to be present here too.
+fn startup_subscription_rules(config: &Config) -> Result<Vec<SubscriptionRule>> {
+    let rules = match config.subscribe_mode {
+        SubscribeMode::Mentions => {
+            vec![SubscriptionRule {
+                name: "mentions".into(),
+                channels: filter::ChannelScope::All("all".into()),
+                kinds: config
+                    .kinds_override
+                    .clone()
+                    .unwrap_or_else(config::default_mention_kinds),
+                require_mention: !config.no_mention_filter,
+                filter: None,
+                compiled_filter: None,
+                consecutive_timeouts: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                prompt_tag: Some("@mention".into()),
+            }]
+        }
+        SubscribeMode::All => {
+            vec![SubscriptionRule {
+                name: "all".into(),
+                channels: filter::ChannelScope::All("all".into()),
+                kinds: config.kinds_override.clone().unwrap_or_default(),
+                require_mention: false,
+                filter: None,
+                compiled_filter: None,
+                consecutive_timeouts: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                prompt_tag: Some("all".into()),
+            }]
+        }
+        SubscribeMode::Config => {
+            // load_rules() already warns if the config file has zero rules.
+            config::load_rules(&config.config_path)?
+        }
+    };
+    Ok(rules)
+}
+
+#[cfg(test)]
+mod edit_mention_admission_tests {
+    use super::*;
+    use crate::edit_routing::test_support::edit_event;
+
+    /// Default normal-mode admission: an edit that newly mentions the agent
+    /// matches the startup rule; an edit without the agent's `p` tag does not.
+    #[tokio::test]
+    async fn default_startup_rules_admit_only_edits_that_mention_the_agent() {
+        let mut config = build_mcp_servers_tests::test_config();
+        config.subscribe_mode = SubscribeMode::Mentions;
+        let agent = config.keys.public_key().to_hex();
+        let rules = startup_subscription_rules(&config).expect("mentions rules");
+        let channel_id = Uuid::new_v4();
+        let target = "ab".repeat(32);
+
+        let mentioned = edit_event(&target, &[["p", agent.as_str()]]);
+        assert!(
+            filter::match_event(&mentioned, channel_id, &rules, &agent)
+                .await
+                .is_some(),
+            "a mention added by an edit must wake the agent"
+        );
+        let unmentioned = edit_event(&target, &[]);
+        assert!(
+            filter::match_event(&unmentioned, channel_id, &rules, &agent)
+                .await
+                .is_none(),
+            "an edit that does not mention the agent must not wake it"
+        );
+    }
+}
+
+#[cfg(test)]
+mod edit_native_steer_tests {
+    use super::*;
+    use crate::edit_routing::test_support::{edit_event, message};
+
+    /// A steered edit renders its original's routing, not the edit's own
+    /// bare `e` tag, so the live turn replies in the original's thread.
+    #[test]
+    fn native_steer_body_carries_edit_original_routing() {
+        let root = "ab".repeat(32);
+        let original = message(Some(&root));
+        let edit = edit_event(&original.id.to_hex(), &[]);
+        let be = queue::BatchEvent {
+            event: edit.clone(),
+            prompt_tag: "@mention".into(),
+            received_at: std::time::Instant::now(),
+            edit: Some(queue::ResolvedEdit {
+                target_event_id: original.id.to_hex(),
+                target_thread_tags: queue::parse_thread_tags(&original),
+            }),
+        };
+        let body = native_steer_body(Uuid::new_v4(), &be);
+        assert!(
+            body.contains(&format!("Edit of: {}", original.id.to_hex())),
+            "{body}"
+        );
+        assert!(body.contains(&format!("root={root}")), "{body}");
+    }
+
+    /// The listener hands the steer path the same resolved route it queues.
+    #[test]
+    fn listener_steer_event_keeps_resolved_edit() {
+        let original = message(None);
+        let edit = edit_event(&original.id.to_hex(), &[]);
+        let channel_id = Uuid::new_v4();
+        let resolved = queue::ResolvedEdit {
+            target_event_id: original.id.to_hex(),
+            target_thread_tags: queue::parse_thread_tags(&original),
+        };
+        let ingress = NormalListenerIngress {
+            buzz_event: relay::BuzzEvent {
+                connection_generation: 0,
+                channel_id,
+                event: edit,
+            },
+            effective_author: "author".into(),
+            prompt_tag: "@mention".into(),
+            edit: Some(resolved.clone()),
+        };
+        let scope = ingress.session_scope(scope::SessionPolicy::Channel, false);
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let queued = ingress.push(&mut queue, scope, false);
+        assert_eq!(queued.steer_event.edit, Some(resolved));
+        assert_eq!(queued.reaction_target_id, original.id.to_hex());
+    }
+
+    /// Drive a routed edit of `original` through the listener's steer decision
+    /// while a turn for `running_event` is in flight under the channel policy.
+    /// Returns the native steer request, if any, and the control signal sent
+    /// to the running turn, if any.
+    fn steer_edit_into_running_turn(
+        running_event: nostr::Event,
+        original: &nostr::Event,
+    ) -> (Option<pool::SteerRequest>, Option<ControlSignal>) {
+        let edit = edit_event(&original.id.to_hex(), &[]);
+        let resolved = queue::ResolvedEdit {
+            target_event_id: original.id.to_hex(),
+            target_thread_tags: queue::parse_thread_tags(original),
+        };
+        steer_into_running_turn(false, Some(false), running_event, edit, Some(resolved))
+    }
+
+    /// Drive `incoming` through the listener's steer decision while a turn
+    /// for `running_event` is in flight in the same conversation session
+    /// (the channel policy, or any DM). `prompt_is_dm` is how the running
+    /// turn's prompt classified the channel; `None` means the prompt has not
+    /// been formatted yet.
+    fn steer_into_running_turn(
+        is_dm: bool,
+        prompt_is_dm: Option<bool>,
+        running_event: nostr::Event,
+        incoming: nostr::Event,
+        incoming_edit: Option<queue::ResolvedEdit>,
+    ) -> (Option<pool::SteerRequest>, Option<ControlSignal>) {
+        let channel_id = Uuid::new_v4();
+        let ingress =
+            |event: nostr::Event, edit: Option<queue::ResolvedEdit>| NormalListenerIngress {
+                buzz_event: relay::BuzzEvent {
+                    connection_generation: 0,
+                    channel_id,
+                    event,
+                },
+                effective_author: "author".into(),
+                prompt_tag: "@mention".into(),
+                edit,
+            };
+
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let running = ingress(running_event, None);
+        let scope = running.session_scope(scope::SessionPolicy::Channel, is_dm);
+        running.push(&mut queue, scope.clone(), is_dm);
+        queue.flush_next().expect("running turn");
+        assert!(queue.is_scope_in_flight(&scope));
+        if let Some(prompt_is_dm) = prompt_is_dm {
+            queue
+                .in_flight_prompt_dm(&scope)
+                .expect("in-flight turn records its prompt classification")
+                .record(prompt_is_dm);
+        }
+
+        let mut pool = AgentPool::from_slots(vec![]);
+        let (control_tx, mut control_rx) = tokio::sync::oneshot::channel();
+        let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel(1);
+        let task = pool.join_set.spawn(async {});
+        pool.task_map_mut().insert(
+            task.id(),
+            pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                scope: Some(scope.clone()),
+                turn_id: "t".into(),
+                recoverable_batch: None,
+                control_tx: Some(control_tx),
+                steer_tx: Some(steer_tx),
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+
+        let incoming_ingress = ingress(incoming, incoming_edit);
+        assert_eq!(
+            incoming_ingress.session_scope(scope::SessionPolicy::Channel, is_dm),
+            scope,
+            "one conversation session spans every thread"
+        );
+        let (ack_tx, _ack_rx) = mpsc::unbounded_channel();
+        incoming_ingress
+            .push(&mut queue, scope.clone(), is_dm)
+            .steer_or_interrupt(
+                MultipleEventHandling::Steer,
+                None,
+                &mut pool,
+                &mut queue,
+                &ack_tx,
+            );
+        (steer_rx.try_recv().ok(), control_rx.try_recv().ok())
+    }
+
+    /// A routed edit whose original is in the running turn's thread is
+    /// steered natively, carrying the original's route, and the running turn
+    /// is not cancelled.
+    #[tokio::test]
+    async fn routed_edit_in_running_thread_steers_natively() {
+        let root = "ab".repeat(32);
+        let original = message(Some(&root));
+        let (steer, control) = steer_edit_into_running_turn(message(Some(&root)), &original);
+
+        let request = steer.expect("edit is sent as a native steer");
+        let body = request.prompt_blocks.join("\n");
+        assert!(
+            body.contains(&format!("Edit of: {}", original.id.to_hex())),
+            "{body}"
+        );
+        assert!(body.contains(&format!("root={root}")), "{body}");
+        assert_eq!(
+            control, None,
+            "native steer must not cancel the running turn"
+        );
+    }
+
+    /// Editing the top-level message a turn is working on steers that turn:
+    /// replies to the edit belong to the same new thread.
+    #[tokio::test]
+    async fn edit_of_running_top_level_trigger_steers_natively() {
+        let original = message(None);
+        let (steer, control) = steer_edit_into_running_turn(original.clone(), &original);
+
+        assert!(steer.is_some(), "edit is sent as a native steer");
+        assert_eq!(
+            control, None,
+            "native steer must not cancel the running turn"
+        );
+    }
+
+    /// Under the channel policy a turn started from thread A can be running
+    /// when an edit whose original is in thread B arrives. A native steer
+    /// would leave the turn's `<context>` replying to A, so the edit takes the
+    /// cancel+merge path instead; its re-prompt routes replies to B.
+    #[tokio::test]
+    async fn routed_edit_for_another_thread_cancels_and_merges() {
+        let thread_b = "ab".repeat(32);
+        let original = message(Some(&thread_b));
+        let (steer, control) = steer_edit_into_running_turn(message(None), &original);
+
+        assert!(steer.is_none(), "no native steer into thread A's turn");
+        assert_eq!(control, Some(ControlSignal::Steer));
+    }
+
+    /// The same rule covers a top-level original: replies to it open a thread
+    /// rooted at the original, not at the running turn's top-level trigger.
+    #[tokio::test]
+    async fn routed_edit_for_another_top_level_message_cancels_and_merges() {
+        let original = message(None);
+        let (steer, control) = steer_edit_into_running_turn(message(None), &original);
+
+        assert!(steer.is_none(), "no native steer across top-level threads");
+        assert_eq!(control, Some(ControlSignal::Steer));
+    }
+
+    /// A top-level DM message's `<context>` names no reply target, so a
+    /// second top-level DM message replies in the same place and is steered
+    /// natively into the running turn rather than cancelling it.
+    #[tokio::test]
+    async fn dm_top_level_follow_up_steers_natively() {
+        let (steer, control) =
+            steer_into_running_turn(true, Some(true), message(None), message(None), None);
+
+        assert!(steer.is_some(), "DM follow-up is sent as a native steer");
+        assert_eq!(
+            control, None,
+            "native steer must not cancel the running turn"
+        );
+    }
+
+    /// Where a dispatched turn is held when the follow-up arrives: the agent
+    /// never answers the first request with this method.
+    enum HoldAt {
+        /// Session setup, before the turn's own prompt is formatted.
+        SessionNew,
+        /// The turn's own prompt is running.
+        Prompt,
+    }
+
+    /// Dispatch a turn for `running_event` through the production
+    /// `dispatch_pending` → `run_prompt_task` path to an agent that holds at
+    /// `hold_at`, then drive `incoming` through the real listener admission.
+    /// `channel_type` is the channel's metadata (`"dm"` or `"stream"`), known
+    /// to the listener and the prompt alike. Returns the native steer request,
+    /// if any, and the control signal sent to the running turn, if any.
+    async fn steer_into_dispatched_turn(
+        channel_type: &str,
+        initial_message: Option<&str>,
+        hold_at: HoldAt,
+        running_event: nostr::Event,
+        incoming: nostr::Event,
+    ) -> (Option<pool::SteerRequest>, Option<ControlSignal>) {
+        let channel_id = Uuid::new_v4();
+        let is_dm = channel_type == "dm";
+        let capture = std::env::temp_dir().join(format!(
+            "buzz-acp-dispatched-steer-{}.ndjson",
+            Uuid::new_v4()
+        ));
+        let quoted_capture = capture.to_string_lossy().replace('\'', "'\\''");
+        let held_method = match hold_at {
+            HoldAt::SessionNew => "session/new",
+            HoldAt::Prompt => "session/prompt",
+        };
+        // Record each request and never answer: the turn stays in flight at
+        // its first request, which is `held_method`.
+        let script = format!(
+            r#"while IFS= read -r line; do printf '%s\n' "$line" >> '{quoted_capture}'; done"#
+        );
+        let acp = acp::AcpClient::spawn("bash", &["-c".into(), script], &[], false)
+            .await
+            .expect("spawn holding ACP");
+        let ingress = |event: nostr::Event| NormalListenerIngress {
+            buzz_event: relay::BuzzEvent {
+                connection_generation: 0,
+                channel_id,
+                event,
+            },
+            effective_author: "author".into(),
+            prompt_tag: "@mention".into(),
+            edit: None,
+        };
+        let running = ingress(running_event);
+        let scope = running.session_scope(scope::SessionPolicy::Channel, is_dm);
+        let mut agent = pool::OwnedAgent {
+            index: 0,
+            acp,
+            state: pool::SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "dispatched-steer-test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+        };
+        if matches!(hold_at, HoldAt::Prompt) {
+            agent
+                .state
+                .sessions
+                .insert(scope.clone(), "live-session".into());
+        }
+        // The relay has no newer metadata, project, or history: every query
+        // returns no events, so the turn keeps the startup channel metadata.
+        let relay = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind relay fixture");
+        let base_url = format!("http://{}", relay.local_addr().unwrap());
+        let relay = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            loop {
+                let (mut socket, _) = relay.accept().await.expect("accept relay query");
+                tokio::spawn(async move {
+                    let mut request = [0; 16384];
+                    let _ = socket.read(&mut request).await;
+                    let _ = socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]",
+                        )
+                        .await;
+                });
+            }
+        });
+        let mut ctx = pool::tests::make_prompt_context_no_owner();
+        ctx.rest_client.base_url = base_url;
+        ctx.initial_message = initial_message.map(str::to_string);
+        ctx.channel_info = pool::ChannelInfoResolver::new(
+            HashMap::from([(
+                channel_id,
+                relay::ChannelInfo {
+                    name: "test-channel".into(),
+                    channel_type: channel_type.into(),
+                    description: None,
+                },
+            )]),
+            ctx.rest_client.clone(),
+        );
+        let ctx = Arc::new(ctx);
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        running.push(&mut queue, scope.clone(), is_dm);
+        let mut last_activity = tokio::time::Instant::now();
+        let dispatched = dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity, None);
+        assert_eq!(dispatched.len(), 1, "the running turn is dispatched");
+
+        // The turn has passed every step before `held_method` once that
+        // request reaches the agent.
+        let held_request = format!("\"{held_method}\"");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !std::fs::read_to_string(&capture)
+                .unwrap_or_default()
+                .contains(&held_request)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("dispatched turn reaches its held request");
+
+        // Observe the listener's decision through the running task's own
+        // steer and control channels.
+        let (control_tx, mut control_rx) = tokio::sync::oneshot::channel();
+        let (steer_tx, mut steer_rx) = tokio::sync::mpsc::channel(1);
+        let meta = pool
+            .task_map_mut()
+            .values_mut()
+            .find(|meta| meta.scope.as_ref() == Some(&scope))
+            .expect("running task");
+        meta.control_tx = Some(control_tx);
+        meta.steer_tx = Some(steer_tx);
+
+        let (ack_tx, _ack_rx) = mpsc::unbounded_channel();
+        ingress(incoming)
+            .push(&mut queue, scope.clone(), is_dm)
+            .steer_or_interrupt(
+                MultipleEventHandling::Steer,
+                None,
+                &mut pool,
+                &mut queue,
+                &ack_tx,
+            );
+        let steer = steer_rx.try_recv().ok();
+        let control = control_rx.try_recv().ok();
+
+        pool.join_set.abort_all();
+        while pool.join_set.join_next().await.is_some() {}
+        relay.abort();
+        let _ = std::fs::remove_file(&capture);
+        (steer, control)
+    }
+
+    /// The DM steer rule depends on the running prompt's own classification,
+    /// which travels from the queue turn through `dispatch_pending` into
+    /// `run_prompt_task`, which records it. Drive that production handoff
+    /// with DM channel metadata, then the real listener admission: a
+    /// top-level follow-up must be steered natively.
+    #[tokio::test]
+    async fn dispatched_dm_turn_records_classification_for_native_steer() {
+        let (steer, control) =
+            steer_into_dispatched_turn("dm", None, HoldAt::Prompt, message(None), message(None))
+                .await;
+
+        assert!(steer.is_some(), "DM follow-up is sent as a native steer");
+        assert_eq!(
+            control, None,
+            "native steer must not cancel the running turn"
+        );
+    }
+
+    /// The prompt task records its classification as soon as channel
+    /// metadata resolves, so a top-level DM follow-up during a slow
+    /// `session/new` is steered natively too.
+    #[tokio::test]
+    async fn dm_follow_up_during_session_setup_steers_natively() {
+        let (steer, control) = steer_into_dispatched_turn(
+            "dm",
+            None,
+            HoldAt::SessionNew,
+            message(None),
+            message(None),
+        )
+        .await;
+
+        assert!(steer.is_some(), "DM follow-up is sent as a native steer");
+        assert_eq!(
+            control, None,
+            "native steer must not cancel the running turn"
+        );
+    }
+
+    /// An `initial_message` setup prompt reads the same steer mailbox, so a
+    /// DM follow-up must not be admitted for native steering before that
+    /// setup turn finishes; it takes the cancel+merge path.
+    #[tokio::test]
+    async fn dm_follow_up_before_initial_message_cancels_and_merges() {
+        let (steer, control) = steer_into_dispatched_turn(
+            "dm",
+            Some("set up the session"),
+            HoldAt::SessionNew,
+            message(None),
+            message(None),
+        )
+        .await;
+
+        assert!(
+            steer.is_none(),
+            "no native steer into the initial_message setup turn"
+        );
+        assert_eq!(control, Some(ControlSignal::Steer));
+    }
+
+    /// A known channel's prompt is never rendered as a DM, so a same-thread
+    /// follow-up is steered natively before the turn's classification is
+    /// recorded, as before DM steering existed: here the prompt task is
+    /// still waiting on `session/new` ahead of an `initial_message`.
+    #[tokio::test]
+    async fn channel_same_thread_follow_up_during_setup_steers_natively() {
+        let root = "ab".repeat(32);
+        let (steer, control) = steer_into_dispatched_turn(
+            "stream",
+            Some("set up the session"),
+            HoldAt::SessionNew,
+            message(Some(&root)),
+            message(Some(&root)),
+        )
+        .await;
+
+        assert!(steer.is_some(), "same-thread follow-up is a native steer");
+        assert_eq!(
+            control, None,
+            "native steer must not cancel the running turn"
+        );
+    }
+
+    /// A DM thread reply needs a `--reply-to` the running top-level turn's
+    /// `<context>` does not carry, so it takes the cancel+merge path.
+    #[tokio::test]
+    async fn dm_thread_reply_during_top_level_turn_cancels_and_merges() {
+        let root = "ab".repeat(32);
+        let (steer, control) =
+            steer_into_running_turn(true, Some(true), message(None), message(Some(&root)), None);
+
+        assert!(
+            steer.is_none(),
+            "no native steer into a different DM thread"
+        );
+        assert_eq!(control, Some(ControlSignal::Steer));
+    }
+
+    /// A DM turn whose prompt was rendered while channel metadata was
+    /// unavailable got channel-style `<context>`: its replies go to a thread
+    /// rooted at its trigger. The DM rule must not apply once metadata
+    /// resolves, so a top-level follow-up takes the cancel+merge path.
+    #[tokio::test]
+    async fn dm_follow_up_into_channel_formatted_turn_cancels_and_merges() {
+        let (steer, control) =
+            steer_into_running_turn(true, Some(false), message(None), message(None), None);
+
+        assert!(
+            steer.is_none(),
+            "steer guard follows the running prompt's classification"
+        );
+        assert_eq!(control, Some(ControlSignal::Steer));
+    }
+
+    /// Before the prompt task records its classification, nothing proves
+    /// which `<context>` a turn in a DM (or a channel of unresolved type)
+    /// will carry, so the follow-up takes the cancel+merge path.
+    #[tokio::test]
+    async fn dm_follow_up_before_prompt_classification_cancels_and_merges() {
+        let (steer, control) =
+            steer_into_running_turn(true, None, message(None), message(None), None);
+
+        assert!(steer.is_none(), "no native steer without a recorded prompt");
+        assert_eq!(control, Some(ControlSignal::Steer));
+    }
+}
+
 #[cfg(test)]
 mod error_outcome_emission_tests {
     //! Pins error-outcome reporting and bounded channel recovery notices:
@@ -12618,7 +13213,11 @@ mod error_outcome_emission_tests {
             prompt_tag: "test".to_string(),
             edit: None,
         }
-        .push(&mut queue, scope::SessionScope::Conversation { channel_id });
+        .push(
+            &mut queue,
+            scope::SessionScope::Conversation { channel_id },
+            false,
+        );
 
         assert!(queued.accepted);
         assert_eq!(

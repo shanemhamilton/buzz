@@ -74,13 +74,14 @@ jobs:
 
   validate-and-build:
     # This fork testing lane neither signs nor publishes a release.
-    if: github.repository == 'shanemhamilton/buzz' && (github.event_name == 'workflow_dispatch' || github.head_ref == 'fix/desktop-agent-workflow-repairs')
+    if: github.repository == 'shanemhamilton/buzz' && (github.event_name == 'workflow_dispatch' || github.head_ref == 'fix/desktop-agent-workflow-repairs' || github.head_ref == 'upgrade/desktop-0.5.27-fork')
     runs-on: macos-latest
     timeout-minutes: 90
     env:
       CARGO_TERM_COLOR: always
       CARGO_BUILD_JOBS: 2
       TARGET: aarch64-apple-darwin
+      UPGRADE_CANDIDATE: ${{ github.head_ref == 'upgrade/desktop-0.5.27-fork' || github.ref_name == 'upgrade/desktop-0.5.27-fork' }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
@@ -107,6 +108,8 @@ jobs:
             src/features/agents/ui/PersonaDeleteDialog.test.mjs \
             src/features/workflows/ui/useWorkflowListAuthorPresentations.test.mjs \
             src/features/workflows/ui/useWorkflowListMessagePresentations.test.mjs
+          node --import ./test-loader.mjs --experimental-strip-types --test \
+            src/features/channels/observedUnreadNative.test.mjs
           node --import ./test-jsdom-setup.mjs --import ./test-loader.mjs \
             --experimental-strip-types --test-force-exit --test \
             src/features/agents/ui/PersonaDeleteDialog.jsdom-test.mjs
@@ -119,6 +122,16 @@ jobs:
           cargo test -p buzz-agent --test fake_llm steer_rejected_on_empty_prompt
           cargo test -p buzz-acp session_resource
           cargo test -p buzz-acp cancelled_
+          cargo test -p buzz-acp queue::tests
+          cargo test -p buzz-acp recovery_wake::tests
+          cargo test -p buzz-acp rest_ -- --test-threads=1
+          cargo test -p buzz-acp thread_summary -- --test-threads=1
+          cargo test -p buzz-acp normal_listener_ephemeral_events_are_excluded_before_replay_state -- --test-threads=1
+          cargo test -p buzz-acp verified_channel_event_is_recorded_and_forwarded -- --test-threads=1
+          cargo test -p buzz-core observer::tests
+          cargo test -p buzz-acp observer_ -- --test-threads=1
+          cargo fmt --all -- --check
+          cargo clippy -p buzz-acp --all-targets -- -D warnings
       - name: Native regression tests
         run: |
           set -euo pipefail
@@ -132,7 +145,7 @@ jobs:
       - name: Version the local repair candidate
         run: |
           set -euo pipefail
-          VERSION=$(node -p "const v=require('./desktop/package.json').version.split('-')[0].split('.'); v[2]=Number(v[2])+1; v.join('.')+'-repair.${GITHUB_RUN_NUMBER}'")
+          VERSION=$(node -p "const base=require('./desktop/package.json').version.split('-')[0]; if (process.env.UPGRADE_CANDIDATE === 'true') { base+'-fork.'+process.env.GITHUB_RUN_NUMBER } else { const v=base.split('.'); v[2]=Number(v[2])+1; v.join('.')+'-repair.'+process.env.GITHUB_RUN_NUMBER }")
           cd desktop
           node scripts/set-version-from-tag.mjs "$VERSION"
           cd src-tauri

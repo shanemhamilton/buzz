@@ -31,6 +31,16 @@ pub(crate) enum NipFiWsRoute {
     Audio,
 }
 
+impl NipFiWsRoute {
+    /// The shadow metrics `route` label.
+    pub(crate) const fn shadow_label(self) -> &'static str {
+        match self {
+            Self::Root => "ws",
+            Self::Audio => "audio",
+        }
+    }
+}
+
 // ── Pairing seam ──────────────────────────────────────────────────────────────
 
 /// Outcome of [`enforce_nip_fi_key_pairing`].
@@ -85,7 +95,7 @@ pub(crate) async fn enforce_nip_fi_key_pairing(
     };
 
     // Matching key → pass.
-    if matches!(assertion.asserted_key(), Some(k) if k == proven_pubkey) {
+    if crate::nip_fi_core::asserted_key_matches(assertion, proven_pubkey) {
         return PairingOutcome::Paired;
     }
 
@@ -224,12 +234,12 @@ pub(crate) fn spawn_nip_fi_expiry_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::tests::{pending_state, test_conn, TestConn};
     use chrono::Utc;
     use nostr::Keys;
     use std::sync::Arc;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
-    use uuid::Uuid;
 
     // ── B3: terminal denial frame survives saturated ctrl_tx ──────────────────
     //
@@ -251,50 +261,25 @@ mod tests {
         let assertion =
             buzz_auth::VerifiedAssertion::for_test(Some(keys.public_key()), vec![deadline]);
 
-        let (send_tx, _send_rx) = mpsc::channel(4);
-        let (ctrl_tx, _ctrl_rx) = mpsc::channel::<WsMessage>(8);
-        let (terminal_ctrl_tx, mut terminal_rx) = mpsc::channel::<WsMessage>(1);
+        let TestConn {
+            conn,
+            ctrl_rx: _ctrl_rx,
+            mut terminal_rx,
+            ..
+        } = test_conn(pending_state(), Some(assertion));
 
         // Saturate ctrl_tx to capacity 8.
         for i in 0..8u8 {
-            ctrl_tx
+            conn.ctrl_tx
                 .try_send(WsMessage::Text(format!("ordinary-{i}").into()))
                 .expect("ctrl_tx has capacity 8");
         }
         assert!(
-            ctrl_tx
+            conn.ctrl_tx
                 .try_send(WsMessage::Text("overflow".into()))
                 .is_err(),
             "ctrl_tx must be full before the test exercises the denial path"
         );
-
-        let conn = Arc::new(crate::connection::ConnectionState {
-            conn_id: Uuid::new_v4(),
-            tenant: buzz_core::tenant::TenantContext::resolved(
-                buzz_core::CommunityId::from_uuid(Uuid::nil()),
-                "test.local".to_string(),
-            ),
-            remote_addr: "127.0.0.1:1234".parse().unwrap(),
-            auth_state: std::sync::Mutex::new(crate::connection::AuthState::Pending {
-                challenge: "test-challenge".to_string(),
-                started_at: std::time::Instant::now(),
-            }),
-            subscriptions: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
-            send_tx,
-            ctrl_tx,
-            terminal_ctrl_tx,
-            cancel: CancellationToken::new(),
-            backpressure_count: Arc::new(std::sync::atomic::AtomicU8::new(0)),
-            grace_limit: 3,
-            nip_fi_assertion: Some(assertion),
-            session_deadline: None,
-            nip_fi_gate: crate::nip_fi_gate::SessionAdmissionGate::off_mode(
-                CancellationToken::new(),
-            ),
-            community_control: crate::state::CommunityConnectionControl::new(
-                CancellationToken::new(),
-            ),
-        });
 
         // Use a different key as the proven pubkey → forced mismatch.
         let wrong_pubkey = Keys::generate().public_key();
@@ -471,5 +456,64 @@ mod tests {
         worker.await.expect("expiry task");
 
         assert!(denial_frames(&mut terminal_rx).is_empty());
+    }
+
+    // ── Characterization: WS key-pairing predicate ───────────────────────────
+
+    fn root_conn_with(
+        assertion: Option<buzz_auth::VerifiedAssertion>,
+    ) -> (
+        Arc<crate::connection::ConnectionState>,
+        mpsc::Receiver<WsMessage>,
+    ) {
+        let TestConn {
+            conn, terminal_rx, ..
+        } = test_conn(pending_state(), assertion);
+        (conn, terminal_rx)
+    }
+
+    fn assertion_for(key: Option<nostr::PublicKey>) -> buzz_auth::VerifiedAssertion {
+        buzz_auth::VerifiedAssertion::for_test(key, vec![Utc::now() + chrono::Duration::hours(1)])
+    }
+
+    // Pins: a claimless assertion (no `nostr_pubkey`) is a pairing denial on
+    // WS with the full terminal effect (denial frame + cancel). [FI-INV-05]
+    // Mutation: treating a missing claim as a match returns Paired.
+    #[tokio::test]
+    async fn characterize_pairing_claimless_assertion_denies() {
+        let (conn, mut terminal_rx) = root_conn_with(Some(assertion_for(None)));
+        let outcome = enforce_nip_fi_key_pairing(
+            conn.nip_fi_assertion.as_ref(),
+            Keys::generate().public_key(),
+            PairingDenialTarget::Root(conn.as_ref()),
+        )
+        .await;
+        assert_eq!(outcome, PairingOutcome::Denied);
+        assert!(conn.cancel.is_cancelled());
+        assert!(
+            terminal_rx.try_recv().is_ok(),
+            "denial frame must be queued"
+        );
+    }
+
+    // Pins: a matching claim pairs with no side effects, and no assertion
+    // (Off mode) pairs unconditionally.
+    // Mutation: inverting the equality, or denying when no assertion is
+    // present, fails these rows.
+    #[tokio::test]
+    async fn characterize_pairing_matching_or_absent_assertion_pairs() {
+        let proven = Keys::generate().public_key();
+        for assertion in [Some(assertion_for(Some(proven))), None] {
+            let (conn, mut terminal_rx) = root_conn_with(assertion);
+            let outcome = enforce_nip_fi_key_pairing(
+                conn.nip_fi_assertion.as_ref(),
+                proven,
+                PairingDenialTarget::Root(conn.as_ref()),
+            )
+            .await;
+            assert_eq!(outcome, PairingOutcome::Paired);
+            assert!(!conn.cancel.is_cancelled());
+            assert!(terminal_rx.try_recv().is_err(), "no denial frame on a pair");
+        }
     }
 }
