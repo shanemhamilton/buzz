@@ -1,5 +1,6 @@
 //! NIP-11 relay information document.
 
+use buzz_core::WORKFLOW_TIMEZONE_EXTENSION;
 use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
@@ -192,7 +193,10 @@ impl RelayInfo {
             supported_nips.push(NIP_RELAY_MEMBERSHIP);
         }
 
-        let mut supported_extensions = vec!["nip-er".to_string()];
+        let mut supported_extensions = vec![
+            "nip-er".to_string(),
+            WORKFLOW_TIMEZONE_EXTENSION.to_string(),
+        ];
         let gif = gif_provider.map(|provider| {
             supported_extensions.push("buzz-gif".to_string());
             GifDescriptor {
@@ -459,6 +463,15 @@ mod tests {
             SUPPORTED_NIPS.contains(&56),
             "NIP-56 (reporting) must be advertised — kind:1984 ingest is live"
         );
+    }
+
+    #[test]
+    fn build_advertises_workflow_timezone_extension() {
+        let info = RelayInfo::build(None, None, false, DEFAULT_MAX_FRAME_BYTES, None, None, None);
+        assert!(info
+            .supported_extensions
+            .expect("extensions")
+            .contains(&WORKFLOW_TIMEZONE_EXTENSION.to_string()));
     }
 
     #[test]
