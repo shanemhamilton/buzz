@@ -123,6 +123,12 @@ pub struct ChannelDeliveryState {
     pub hydrated_thread_roots: VecDeque<String>,
 }
 
+/// Consecutive `AgentError` prompt failures on one session before its cached
+/// id is dropped and the next turn calls `session/new`. Two keeps the
+/// "one bad LLM response does not cost the session" behavior while bounding
+/// how long a dead backend session is retried.
+pub const MAX_CONSECUTIVE_SESSION_ERRORS: u32 = 2;
+
 /// Per-channel session IDs, turn counters, and delivery state.
 ///
 /// Separated from `OwnedAgent` so the state machine is testable without
@@ -137,6 +143,11 @@ pub struct SessionState {
     pub turn_counts: HashMap<SessionScope, u32>,
     /// Turn counter for the heartbeat session.
     pub heartbeat_turn_count: u32,
+    /// Consecutive `AgentError` prompt failures per scope while the agent
+    /// process stayed up. Cleared on success and on every invalidation path.
+    pub error_streaks: HashMap<SessionScope, u32>,
+    /// Consecutive `AgentError` prompt failures for the heartbeat session.
+    pub heartbeat_error_streak: u32,
     /// Whether the live heartbeat session has successfully received `<base>`.
     pub heartbeat_standing_context_sent: bool,
     /// session scope → rendered NIP-AE core prompt section, populated once at
@@ -174,13 +185,42 @@ impl SessionState {
                 self.heartbeat_session = None;
                 self.heartbeat_turn_count = 0;
                 self.heartbeat_standing_context_sent = false;
+                self.heartbeat_error_streak = 0;
             }
+        }
+    }
+
+    /// Record a prompt that failed with an [`AcpError::AgentError`] while the
+    /// agent process stayed up. Returns `true` when the source's session must
+    /// be dropped so the next turn calls `session/new`: either the agent said
+    /// the session is gone, or the same session has now failed
+    /// [`MAX_CONSECUTIVE_SESSION_ERRORS`] prompts in a row. The streak guard
+    /// exists because some agents (Antigravity ACP) lose their backend session
+    /// and then answer every prompt with a bare "Internal error", which would
+    /// otherwise be retried against the dead session until dead-lettered.
+    pub fn record_prompt_error(&mut self, source: &PromptSource, session_lost: bool) -> bool {
+        let streak = match source {
+            PromptSource::Channel(scope) => self.error_streaks.entry(scope.clone()).or_insert(0),
+            PromptSource::Heartbeat => &mut self.heartbeat_error_streak,
+        };
+        *streak += 1;
+        session_lost || *streak >= MAX_CONSECUTIVE_SESSION_ERRORS
+    }
+
+    /// Reset the consecutive-error streak after a successful prompt.
+    pub fn clear_prompt_errors(&mut self, source: &PromptSource) {
+        match source {
+            PromptSource::Channel(scope) => {
+                self.error_streaks.remove(scope);
+            }
+            PromptSource::Heartbeat => self.heartbeat_error_streak = 0,
         }
     }
 
     /// Invalidate a single session scope's session and turn counter.
     /// Returns `true` if the scope had an active session.
     pub fn invalidate_scope(&mut self, scope: &SessionScope) -> bool {
+        self.error_streaks.remove(scope);
         self.turn_counts.remove(scope);
         self.core_sections.remove(scope);
         self.canvas_sections.remove(scope);
@@ -219,8 +259,10 @@ impl SessionState {
     pub fn invalidate_all(&mut self) {
         self.sessions.clear();
         self.turn_counts.clear();
+        self.error_streaks.clear();
         self.heartbeat_session = None;
         self.heartbeat_turn_count = 0;
+        self.heartbeat_error_streak = 0;
         self.heartbeat_standing_context_sent = false;
         self.core_sections.clear();
         self.canvas_sections.clear();
@@ -3397,6 +3439,7 @@ pub async fn run_prompt_task(
     match prompt_result {
         Ok(stop_reason) => {
             log_stop_reason(&source, &stop_reason);
+            agent.state.clear_prompt_errors(&source);
 
             if let PromptSource::Channel(scope) = &source {
                 let standing_sent = !agent.has_system_prompt_support();
@@ -3602,10 +3645,26 @@ pub async fn run_prompt_task(
         }
         Err(e) => {
             tracing::error!(target: "pool::prompt", "session_prompt error: {e}");
-            // AgentError means the agent caught a problem before mutating
-            // session state (e.g. bad LLM response). The session is healthy —
-            // don't invalidate it. Other errors may have corrupted state.
-            if !matches!(e, AcpError::AgentError { .. }) {
+            // AgentError usually means the agent caught a problem before
+            // mutating session state (e.g. bad LLM response), so the session
+            // is kept. Two exceptions drop it so the next turn starts a fresh
+            // session: the agent says the session no longer exists, or this
+            // session has failed consecutive prompts (see
+            // `SessionState::record_prompt_error`). Other errors may have
+            // corrupted state and always invalidate.
+            let drop_session = if matches!(e, AcpError::AgentError { .. }) {
+                agent.state.record_prompt_error(&source, e.is_session_lost())
+            } else {
+                true
+            };
+            if drop_session {
+                if matches!(e, AcpError::AgentError { .. }) {
+                    tracing::warn!(
+                        target: "pool::session",
+                        "dropping session for {} after agent error; next turn starts a new session: {e}",
+                        prompt_label(&source)
+                    );
+                }
                 agent.state.invalidate(&source);
             }
             let usage = agent.acp.take_turn_usage();
@@ -9065,6 +9124,51 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         assert!(s.heartbeat_session.is_none());
         assert_eq!(s.heartbeat_turn_count, 0);
         assert!(!s.heartbeat_standing_context_sent);
+    }
+
+    #[test]
+    fn record_prompt_error_drops_session_on_second_consecutive_error() {
+        let (mut s, ch_a, ch_b) = make_state();
+        let src = PromptSource::Channel(conv(ch_a));
+        // One AgentError keeps the session (a bad LLM response is not fatal).
+        assert!(!s.record_prompt_error(&src, false));
+        assert!(s.sessions.contains_key(&conv(ch_a)));
+        // A second consecutive error on the same session asks for a drop.
+        assert!(s.record_prompt_error(&src, false));
+        s.invalidate(&src);
+        assert!(!s.sessions.contains_key(&conv(ch_a)));
+        assert!(!s.error_streaks.contains_key(&conv(ch_a)));
+        // The sibling channel's session and streak are untouched.
+        assert!(s.sessions.contains_key(&conv(ch_b)));
+        assert!(!s.record_prompt_error(&PromptSource::Channel(conv(ch_b)), false));
+    }
+
+    #[test]
+    fn record_prompt_error_drops_session_immediately_when_agent_lost_it() {
+        let (mut s, ch_a, _ch_b) = make_state();
+        let src = PromptSource::Channel(conv(ch_a));
+        assert!(s.record_prompt_error(&src, true));
+    }
+
+    #[test]
+    fn clear_prompt_errors_resets_streak_after_success() {
+        let (mut s, ch_a, _ch_b) = make_state();
+        let src = PromptSource::Channel(conv(ch_a));
+        assert!(!s.record_prompt_error(&src, false));
+        s.clear_prompt_errors(&src);
+        // Streak restarted: the next error is the first again.
+        assert!(!s.record_prompt_error(&src, false));
+        assert!(s.record_prompt_error(&src, false));
+    }
+
+    #[test]
+    fn heartbeat_error_streak_follows_the_same_rule() {
+        let (mut s, _ch_a, _ch_b) = make_state();
+        assert!(!s.record_prompt_error(&PromptSource::Heartbeat, false));
+        assert!(s.record_prompt_error(&PromptSource::Heartbeat, false));
+        s.invalidate(&PromptSource::Heartbeat);
+        assert_eq!(s.heartbeat_error_streak, 0);
+        assert!(s.heartbeat_session.is_none());
     }
 
     #[test]

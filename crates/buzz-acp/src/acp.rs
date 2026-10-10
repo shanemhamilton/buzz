@@ -125,6 +125,21 @@ pub enum AcpError {
     AgentError { code: i64, message: String },
 }
 
+impl AcpError {
+    /// True when the agent reports that the session this turn targeted no
+    /// longer exists on its side. The cached session id is useless after
+    /// this: the caller must drop it so the next turn calls `session/new`.
+    pub fn is_session_lost(&self) -> bool {
+        match self {
+            AcpError::AgentError { message, .. } => {
+                let m = message.to_ascii_lowercase();
+                m.contains("session not found") || m.contains("unknown session")
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Build an [`AcpError::AgentError`] from a JSON-RPC error object,
 /// preserving the numeric code. When the `message` field is missing or
 /// non-string, fall back to the full JSON object so provider-specific
@@ -5077,6 +5092,21 @@ sleep 1"#,
             }
             other => panic!("expected AgentError, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn is_session_lost_matches_agent_session_not_found_only() {
+        let lost = AcpError::AgentError {
+            code: -32603,
+            message: "Session not found: 001ce9ab".into(),
+        };
+        assert!(lost.is_session_lost());
+        let internal = AcpError::AgentError {
+            code: -32603,
+            message: "Internal error".into(),
+        };
+        assert!(!internal.is_session_lost());
+        assert!(!AcpError::Protocol("session not found".into()).is_session_lost());
     }
 
     #[test]
