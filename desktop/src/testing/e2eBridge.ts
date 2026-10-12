@@ -159,6 +159,7 @@ type MockPersonaSeed = {
   displayName: string;
   avatarUrl?: string | null;
   systemPrompt: string;
+  acpCommand?: string | null;
   updatedAt?: string;
   isActive?: boolean;
   shared?: boolean;
@@ -601,6 +602,7 @@ type E2eConfig = {
       provider: string | null;
       model: string | null;
       preferred_runtime?: string | null;
+      default_acp_command?: string | null;
     };
     /** Explicit owner-only agent-access capability; independent of baked defaults. */
     ownerOnlyAccessBuild?: boolean;
@@ -2697,6 +2699,7 @@ function resetMockPersonas(config?: E2eConfig) {
       display_name: persona.displayName,
       avatar_url: persona.avatarUrl ?? null,
       system_prompt: persona.systemPrompt,
+      acp_command: persona.acpCommand ?? "buzz-acp",
       runtime: persona.runtime ?? null,
       model: persona.model ?? null,
       provider: persona.provider ?? null,
@@ -8673,6 +8676,7 @@ let mockGlobalAgentConfig: {
   provider: string | null;
   model: string | null;
   preferred_runtime?: string | null;
+  default_acp_command?: string | null;
 } | null = null;
 
 // Per-page get_nsec call counter for sequenced error testing.
@@ -8959,7 +8963,10 @@ async function handleCreatePersona(args: {
     avatar_url: args.input.avatarUrl?.trim() || null,
     description: args.input.description?.trim() || null,
     system_prompt: args.input.systemPrompt.trim(),
-    acp_command: args.input.acpCommand ?? "buzz-acp",
+    acp_command:
+      args.input.acpCommand ??
+      mockGlobalAgentConfig?.default_acp_command ??
+      "buzz-acp",
     runtime: args.input.runtime?.trim() || null,
     model: args.input.model?.trim() || null,
     provider: args.input.provider?.trim() || null,
@@ -9653,7 +9660,10 @@ async function handleCreateManagedAgent(
     // Create never pins a harness id — the record inherits from the persona.
     runtime: null,
     relay_url: args.input.relayUrl ?? DEFAULT_RELAY_WS_URL,
-    acp_command: args.input.acpCommand ?? "buzz-acp",
+    acp_command:
+      args.input.acpCommand ??
+      mockGlobalAgentConfig?.default_acp_command ??
+      "buzz-acp",
     agent_command: agentCommand,
     agent_args: agentArgs,
     mcp_command: args.input.mcpCommand ?? "",
@@ -14254,6 +14264,7 @@ export function maybeInstallE2eTauriMocks() {
             provider: null,
             model: null,
             preferred_runtime: null,
+            default_acp_command: null,
           }
         );
       }
@@ -14277,6 +14288,7 @@ export function maybeInstallE2eTauriMocks() {
               provider: string | null;
               model: string | null;
               preferred_runtime: string | null;
+              default_acp_command?: string | null;
             };
           }
         ).config;

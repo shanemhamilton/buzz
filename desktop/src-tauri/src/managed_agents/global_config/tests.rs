@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
 use super::{
-    normalize_global_config_fields, resolve_effective_model_provider, strip_empty_env_vars,
-    validate_global_config, GlobalAgentConfig,
+    normalize_global_config_fields, resolve_created_acp_command, resolve_created_agent_acp_command,
+    resolve_effective_model_provider, strip_empty_env_vars, validate_global_config,
+    GlobalAgentConfig,
 };
 use crate::managed_agents::{AgentDefinition, BackendKind, ManagedAgentRecord, RespondTo};
 
@@ -258,6 +259,97 @@ fn default_config_is_all_none_empty() {
     assert!(config.env_vars.is_empty());
     assert!(config.provider.is_none());
     assert!(config.model.is_none());
+    assert!(config.default_acp_command.is_none());
+}
+
+#[test]
+fn default_acp_command_is_backward_compatible_and_normalized() {
+    let old: GlobalAgentConfig = serde_json::from_str(
+        r#"{"env_vars":{},"provider":null,"model":null,"preferred_runtime":null}"#,
+    )
+    .unwrap();
+    assert_eq!(old.default_acp_command, None);
+    let mut config = GlobalAgentConfig {
+        default_acp_command: Some("  buzz-repair33fb8fe-acp  ".into()),
+        ..Default::default()
+    };
+    normalize_global_config_fields(&mut config);
+    assert_eq!(
+        config.default_acp_command.as_deref(),
+        Some("buzz-repair33fb8fe-acp")
+    );
+    config.default_acp_command = Some("   ".into());
+    normalize_global_config_fields(&mut config);
+    assert_eq!(config.default_acp_command, None);
+}
+
+#[test]
+fn default_acp_command_validation_and_creation_precedence() {
+    let mut global = GlobalAgentConfig {
+        default_acp_command: Some("buzz-repair33fb8fe-acp".into()),
+        ..Default::default()
+    };
+    assert!(validate_global_config(&global).is_ok());
+    assert_eq!(
+        resolve_created_acp_command(None, &global),
+        "buzz-repair33fb8fe-acp"
+    );
+    assert_eq!(
+        resolve_created_acp_command(Some("  buzz-explicit-acp "), &global),
+        "buzz-explicit-acp"
+    );
+    assert_eq!(
+        resolve_created_acp_command(Some("buzz-acp"), &global),
+        "buzz-acp"
+    );
+    assert_eq!(
+        resolve_created_agent_acp_command(Some(None), None, &global),
+        crate::managed_agents::DEFAULT_ACP_COMMAND,
+        "a linked legacy persona with no command retains stock ACP"
+    );
+    assert_eq!(
+        resolve_created_agent_acp_command(Some(Some("buzz-persona-acp")), None, &global),
+        "buzz-persona-acp"
+    );
+    assert_eq!(
+        resolve_created_agent_acp_command(None, Some("buzz-explicit-acp"), &global),
+        "buzz-explicit-acp"
+    );
+    global.default_acp_command = None;
+    assert_eq!(
+        resolve_created_acp_command(None, &global),
+        crate::managed_agents::DEFAULT_ACP_COMMAND
+    );
+    let too_long = format!("buzz-{}-acp", "x".repeat(252));
+    for invalid in [
+        "bad command".to_string(),
+        "buzz-\0-acp".to_string(),
+        too_long,
+    ] {
+        global.default_acp_command = Some(invalid.clone());
+        assert!(
+            validate_global_config(&global).is_err(),
+            "accepted {invalid:?}"
+        );
+    }
+}
+
+#[test]
+fn global_acp_default_does_not_rewrite_existing_agent_configuration() {
+    let record = bare_record();
+    let before = GlobalAgentConfig::default();
+    let after = GlobalAgentConfig {
+        default_acp_command: Some("buzz-repair33fb8fe-acp".into()),
+        ..Default::default()
+    };
+    let before_effective = resolve_effective_model_provider(&record, &[], &before);
+    let after_effective = resolve_effective_model_provider(&record, &[], &after);
+
+    assert_eq!(
+        record.acp_command,
+        crate::managed_agents::DEFAULT_ACP_COMMAND
+    );
+    assert_eq!(before_effective, after_effective);
 }
 
 #[test]
@@ -267,6 +359,7 @@ fn roundtrip_serialization() {
         provider: Some("anthropic".to_string()),
         model: Some("claude-opus-4".to_string()),
         preferred_runtime: Some("claude".to_string()),
+        default_acp_command: None,
     };
     let json = serde_json::to_string(&config).expect("serialize");
     let back: GlobalAgentConfig = serde_json::from_str(&json).expect("deserialize");
@@ -601,6 +694,7 @@ fn populated_global_config_round_trips() {
         provider: Some("anthropic".to_string()),
         model: Some("claude-opus-4-5".to_string()),
         preferred_runtime: None,
+        default_acp_command: None,
     };
     let json = serde_json::to_string(&original).expect("serialization must not fail");
     let decoded: GlobalAgentConfig =

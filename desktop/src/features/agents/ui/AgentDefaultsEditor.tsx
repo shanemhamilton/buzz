@@ -21,6 +21,7 @@ import type { GlobalAgentConfig } from "@/shared/api/types";
 import { getBakedBuildEnv, type BakedEnvEntry } from "@/shared/api/tauri";
 import { globalAgentConfigQueryKey } from "@/features/agents/useGlobalAgentConfig";
 import {
+  useAcpCommandsQuery,
   useAcpRuntimesQuery,
   useRuntimeFileConfigQuery,
 } from "@/features/agents/hooks";
@@ -40,6 +41,9 @@ import {
 } from "@/features/agents/ui/AgentConfigFields";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
+
+import { AcpCommandField } from "./AcpCommandField";
+import { DEFAULT_ACP_COMMAND_VALUE } from "./acpCommandPicker";
 
 type SaveState = "idle" | "saving" | "saved" | "error";
 
@@ -135,6 +139,7 @@ export function AgentDefaultsEditor({
       });
   }, []);
 
+  const acpCommandsQuery = useAcpCommandsQuery();
   const runtimesQuery = useAcpRuntimesQuery();
   const sortedRuntimes = React.useMemo(
     () => sortPersonaRuntimes(runtimesQuery.data ?? []),
@@ -303,6 +308,21 @@ export function AgentDefaultsEditor({
               value={selectedRuntime?.id ?? ""}
             />
           </div>
+          <AcpCommandField
+            candidates={acpCommandsQuery.data ?? []}
+            description="Used for new agents unless you select another command. Existing agents keep their saved command."
+            disabled={acpCommandsQuery.isLoading}
+            id="global-agent-default-acp-command"
+            label="Default ACP command"
+            onValueChange={(command) =>
+              handleConfigChange({
+                ...renderedConfig,
+                default_acp_command:
+                  command === DEFAULT_ACP_COMMAND_VALUE ? null : command,
+              })
+            }
+            value={config.default_acp_command ?? DEFAULT_ACP_COMMAND_VALUE}
+          />
           {flatLayout ? (
             <AnimatePresence initial={false}>
               {configFields ? (

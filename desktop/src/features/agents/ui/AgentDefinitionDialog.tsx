@@ -147,7 +147,7 @@ export function AgentDefinitionDialog({
   const aiDefaultsTriggerRef = React.useRef<HTMLButtonElement>(null);
   const [avatarUrl, setAvatarUrl] = React.useState("");
   const [systemPrompt, setSystemPrompt] = React.useState("");
-  const [acpCommand, setAcpCommand] = React.useState("buzz-acp");
+  const [acpCommand, setAcpCommand] = React.useState<string | undefined>();
   const [runtime, setRuntime] = React.useState("");
   const [model, setModel] = React.useState("");
   const [isCustomModelEditing, setIsCustomModelEditing] = React.useState(false);
@@ -164,15 +164,9 @@ export function AgentDefinitionDialog({
   // The seed the draft is diffed against at submit: an untouched quad
   // submits no behavior group, keeping unrelated edits hash-quiet.
   const behaviorSeedRef = React.useRef(emptyPersonaBehaviorDraft);
-  // Tracks when the runtime was auto-seeded by the default-runtime effect in
-  // edit mode (i.e. the user never explicitly chose a runtime). Used to omit
-  // the seeded runtime from the submit payload for builtin definitions whose
-  // canonical runtime is null — the sync would revert it anyway.
+  // Omit auto-seeded runtime from edits to builtins whose canonical runtime is null.
   const isRuntimeAutoSeededRef = React.useRef(false);
-  // Guards the seeding effect so it fires at most once per dialog-open.
-  // Without this, clearing runtime back to "" via "No preference" would re-
-  // trigger the effect (the `runtime` dep would pass the length guard) and
-  // snap the dropdown back to the default — an edit-mode regression.
+  // Seed once per open so clearing to "No preference" does not restore the default.
   const hasSeededForOpenRef = React.useRef(false);
   const [showAdvancedFields, setShowAdvancedFields] = React.useState(false);
   const [isAvatarUploadPending, setIsAvatarUploadPending] =
@@ -210,7 +204,10 @@ export function AgentDefinitionDialog({
     setDescriptionDraft(initialValues.description ?? "");
     setAvatarUrl(initialValues.avatarUrl ?? "");
     setSystemPrompt(initialValues.systemPrompt);
-    setAcpCommand(initialValues.acpCommand ?? "buzz-acp");
+    setAcpCommand(
+      initialValues.acpCommand ??
+        ("id" in initialValues ? "buzz-acp" : undefined),
+    );
     setRuntime(initialValues.runtime ?? "");
     setModel(initialValues.model ?? "");
     setIsCustomModelEditing(false);
@@ -300,7 +297,7 @@ export function AgentDefinitionDialog({
       setDisplayName("");
       setAvatarUrl("");
       setSystemPrompt("");
-      setAcpCommand("buzz-acp");
+      setAcpCommand(undefined);
       setRuntime("");
       setModel("");
       setIsCustomModelEditing(false);
@@ -352,7 +349,7 @@ export function AgentDefinitionDialog({
       description: descriptionDraft,
       avatarUrl: avatarUrl.trim() || undefined,
       systemPrompt: systemPrompt,
-      acpCommand: acpCommand.trim() || "buzz-acp",
+      acpCommand: acpCommand?.trim() || undefined,
       runtime: runtimeForSubmit,
       model: modelForSubmit,
       provider: providerForSubmit,
@@ -811,7 +808,9 @@ export function AgentDefinitionDialog({
                   setAcpCommand(command);
                   setHasUserChanges(true);
                 }}
-                value={acpCommand}
+                value={
+                  acpCommand ?? globalConfig.default_acp_command ?? "buzz-acp"
+                }
               />
             </>
           ) : null}

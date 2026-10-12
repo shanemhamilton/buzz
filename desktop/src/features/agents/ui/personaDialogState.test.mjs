@@ -64,7 +64,7 @@ test("createPersonaDialogState returns a fresh empty draft", () => {
     displayName: "",
     avatarUrl: "",
     systemPrompt: "",
-    acpCommand: "buzz-acp",
+    acpCommand: undefined,
     runtime: undefined,
     model: undefined,
   });

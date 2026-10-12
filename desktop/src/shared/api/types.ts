@@ -912,6 +912,8 @@ export type GlobalAgentConfig = {
   model: string | null;
   /** Preferred ACP runtime for agents without a persona-specific runtime. */
   preferred_runtime: string | null;
+  /** ACP bridge copied into new agents; existing agent commands stay unchanged. */
+  default_acp_command?: string | null;
 };
 
 /**

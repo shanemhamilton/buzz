@@ -13,7 +13,7 @@ use crate::{
         stop_managed_agent_workspace_pair, sync_managed_agent_processes, try_regenerate_nest,
         validate_provider_config, BackendKind, CreateManagedAgentRequest,
         CreateManagedAgentResponse, ManagedAgentRecord, ManagedAgentSummary, RelayMeshConfig,
-        DEFAULT_ACP_COMMAND, DEFAULT_AGENT_PARALLELISM, DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
+        DEFAULT_AGENT_PARALLELISM, DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
     },
     relay::relay_ws_url_with_override,
     util::now_iso,
@@ -608,14 +608,22 @@ pub async fn create_managed_agent(
             auth_tag: auth_tag.clone(),
             relay_url: resolved_relay_url.clone(),
             avatar_url: resolved_avatar_url.clone(),
-            acp_command: linked_persona
-                .as_ref()
-                .and_then(|persona| persona.acp_command.as_deref())
-                .or(input.acp_command.as_deref())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or(DEFAULT_ACP_COMMAND)
-                .to_string(),
+            acp_command: {
+                if let Some(persona) = linked_persona.as_ref() {
+                    crate::managed_agents::resolve_created_agent_acp_command(
+                        Some(persona.acp_command.as_deref()),
+                        None,
+                        &crate::managed_agents::GlobalAgentConfig::default(),
+                    )
+                } else {
+                    let global_config = crate::managed_agents::load_global_agent_config(&app)?;
+                    crate::managed_agents::resolve_created_agent_acp_command(
+                        None,
+                        input.acp_command.as_deref(),
+                        &global_config,
+                    )
+                }
+            },
             agent_command,
             agent_command_override,
             agent_args,

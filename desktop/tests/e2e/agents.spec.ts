@@ -869,7 +869,14 @@ test("agent defaults stays in the header without an actions menu", async ({
       model: "gpt-5.5[high]",
       preferred_runtime: "codex",
       provider: null,
+      default_acp_command: null,
     },
+    acpCommands: [
+      {
+        command: "buzz-repair33fb8fe-acp",
+        binaryPath: "/usr/local/bin/buzz-repair33fb8fe-acp",
+      },
+    ],
   });
   await gotoApp(page);
   await page.getByTestId("open-agents-view").click();
@@ -896,8 +903,110 @@ test("agent defaults stays in the header without an actions menu", async ({
   await expect(defaultsDialog.getByTestId("global-agent-model")).toContainText(
     "GPT-5.5 (high)",
   );
-  await page.keyboard.press("Escape");
+  const acpDefault = defaultsDialog.locator(
+    "#global-agent-default-acp-command",
+  );
+  await expect(acpDefault).toContainText("Buzz ACP (default)");
+  await acpDefault.click();
+  await page
+    .getByRole("menuitemradio", {
+      name: "buzz-repair33fb8fe-acp",
+      exact: true,
+    })
+    .click();
+  await expect(acpDefault).toContainText("buzz-repair33fb8fe-acp");
+  await defaultsDialog.getByRole("button", { name: "Save defaults" }).click();
   await expect(defaultsDialog).toHaveCount(0);
+
+  await defaultsButton.click();
+  const reopenedDefaults = page.getByTestId("agent-ai-defaults-dialog");
+  await expect(
+    reopenedDefaults.locator("#global-agent-default-acp-command"),
+  ).toContainText("buzz-repair33fb8fe-acp");
+  await page.keyboard.press("Escape");
+});
+
+test("new persona inherits the ACP default but stock override wins", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    acpCommands: [
+      {
+        command: "buzz-repair33fb8fe-acp",
+        binaryPath: "/usr/local/bin/buzz-repair33fb8fe-acp",
+      },
+    ],
+    globalAgentConfig: {
+      env_vars: {},
+      model: "gpt-5.5[high]",
+      preferred_runtime: "codex",
+      provider: null,
+      default_acp_command: "buzz-repair33fb8fe-acp",
+    },
+    personas: [
+      {
+        id: "custom:existing-acp",
+        displayName: "Existing ACP",
+        systemPrompt: "Keep this transport unchanged.",
+        acpCommand: "buzz-repair33fb8fe-acp",
+        runtime: "codex",
+        model: "gpt-5.5[high]",
+      },
+    ],
+  });
+  await gotoApp(page);
+  await page.getByTestId("open-agents-view").click();
+  await page.getByTestId("new-agent-card").click();
+
+  const dialog = page.getByTestId("persona-dialog");
+  await dialog.getByRole("tab", { name: "Customize for this agent" }).click();
+  await expect(dialog.locator("#persona-acp-command")).toContainText(
+    "buzz-repair33fb8fe-acp",
+  );
+  await dialog.locator("#persona-display-name").fill("New Inherited ACP");
+  await dialog
+    .locator("#persona-system-prompt")
+    .fill("Use inherited transport.");
+  await dialog.getByRole("button", { name: "Create agent" }).click();
+  await expect(dialog).toHaveCount(0);
+
+  await page.getByTestId("new-agent-card").click();
+  const overrideDialog = page.getByTestId("persona-dialog");
+  await overrideDialog
+    .getByRole("tab", { name: "Customize for this agent" })
+    .click();
+  await expect(overrideDialog.locator("#persona-acp-command")).toContainText(
+    "buzz-repair33fb8fe-acp",
+  );
+  await overrideDialog.locator("#persona-acp-command").click();
+  await page
+    .getByRole("menuitemradio", { name: "Buzz ACP (default)", exact: true })
+    .click();
+  await expect(overrideDialog.locator("#persona-acp-command")).toContainText(
+    "Buzz ACP (default)",
+  );
+  await overrideDialog.locator("#persona-display-name").fill("New Stock ACP");
+  await overrideDialog
+    .locator("#persona-system-prompt")
+    .fill("Use stock transport.");
+  await overrideDialog.getByRole("button", { name: "Create agent" }).click();
+  await expect(overrideDialog).toHaveCount(0);
+
+  const personas = await invokeTauri<
+    Array<{ id: string; display_name: string; acp_command?: string | null }>
+  >(page, "list_personas");
+  expect(
+    personas.find((persona) => persona.display_name === "New Inherited ACP")
+      ?.acp_command,
+  ).toBe("buzz-repair33fb8fe-acp");
+  expect(
+    personas.find((persona) => persona.display_name === "New Stock ACP")
+      ?.acp_command,
+  ).toBe("buzz-acp");
+  expect(
+    personas.find((persona) => persona.id === "custom:existing-acp")
+      ?.acp_command,
+  ).toBe("buzz-repair33fb8fe-acp");
 });
 
 test("unconfigured agent defaults use the setup label", async ({ page }) => {

@@ -86,6 +86,7 @@ type MockPersonaSeed = {
   displayName: string;
   avatarUrl?: string | null;
   systemPrompt: string;
+  acpCommand?: string | null;
   updatedAt?: string;
   isActive?: boolean;
   shared?: boolean;
@@ -531,6 +532,7 @@ type MockBridgeOptions = {
     provider: string | null;
     model: string | null;
     preferred_runtime?: string | null;
+    default_acp_command?: string | null;
   };
   ownerOnlyAccessBuild?: boolean;
   /** File-layer config returned by runtime id. */
