@@ -732,11 +732,7 @@ test("ACP default saves only on Save and survives reload and failed discovery", 
   // A catalog failure must preserve the saved command, not silently reset it.
   // Select stock explicitly, then save through the real parent component.
   await act(async () => {
-    fireEvent.pointerDown(picker, {
-      button: 0,
-      ctrlKey: false,
-      pointerType: "mouse",
-    });
+    fireEvent.keyDown(picker, { key: "Enter" });
   });
   await settle();
   await act(async () => {

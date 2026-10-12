@@ -2699,7 +2699,7 @@ function resetMockPersonas(config?: E2eConfig) {
       display_name: persona.displayName,
       avatar_url: persona.avatarUrl ?? null,
       system_prompt: persona.systemPrompt,
-      acp_command: persona.acpCommand ?? "buzz-acp",
+      acp_command: persona.acpCommand,
       runtime: persona.runtime ?? null,
       model: persona.model ?? null,
       provider: persona.provider ?? null,
@@ -9661,9 +9661,11 @@ async function handleCreateManagedAgent(
     runtime: null,
     relay_url: args.input.relayUrl ?? DEFAULT_RELAY_WS_URL,
     acp_command:
-      args.input.acpCommand ??
-      mockGlobalAgentConfig?.default_acp_command ??
-      "buzz-acp",
+      linkedPersona?.acp_command?.trim() ||
+      args.input.acpCommand?.trim() ||
+      (linkedPersona
+        ? "buzz-acp"
+        : mockGlobalAgentConfig?.default_acp_command || "buzz-acp"),
     agent_command: agentCommand,
     agent_args: agentArgs,
     mcp_command: args.input.mcpCommand ?? "",

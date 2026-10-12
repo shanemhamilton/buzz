@@ -213,7 +213,12 @@ pub(crate) fn resolve_created_agent_acp_command(
     global: &GlobalAgentConfig,
 ) -> String {
     if let Some(persona_command) = persona_command {
-        return resolve_created_acp_command(persona_command, &GlobalAgentConfig::default());
+        return persona_command
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| explicit.map(str::trim).filter(|value| !value.is_empty()))
+            .unwrap_or(super::DEFAULT_ACP_COMMAND)
+            .to_string();
     }
     resolve_created_acp_command(explicit, global)
 }

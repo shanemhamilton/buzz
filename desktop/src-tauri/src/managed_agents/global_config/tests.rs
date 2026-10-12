@@ -303,6 +303,11 @@ fn default_acp_command_validation_and_creation_precedence() {
         "buzz-acp"
     );
     assert_eq!(
+        resolve_created_agent_acp_command(Some(None), Some("buzz-instance-acp"), &global),
+        "buzz-instance-acp",
+        "an explicit instance command remains available to linked legacy personas"
+    );
+    assert_eq!(
         resolve_created_agent_acp_command(Some(None), None, &global),
         crate::managed_agents::DEFAULT_ACP_COMMAND,
         "a linked legacy persona with no command retains stock ACP"

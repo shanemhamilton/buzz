@@ -612,7 +612,7 @@ pub async fn create_managed_agent(
                 if let Some(persona) = linked_persona.as_ref() {
                     crate::managed_agents::resolve_created_agent_acp_command(
                         Some(persona.acp_command.as_deref()),
-                        None,
+                        input.acp_command.as_deref(),
                         &crate::managed_agents::GlobalAgentConfig::default(),
                     )
                 } else {
