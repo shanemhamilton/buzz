@@ -46,7 +46,7 @@ export function createPersonaDialogState(): PersonaDialogState {
       displayName: "",
       avatarUrl: "",
       systemPrompt: "",
-      acpCommand: "buzz-acp",
+      acpCommand: undefined,
       runtime: undefined,
       model: undefined,
     },

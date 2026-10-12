@@ -148,6 +148,7 @@ function makeIpcHandler(overrides = {}) {
       return Promise.resolve([rawGooseCatalogEntry()]);
     if (cmd === "discover_agent_models")
       return Promise.resolve({ options: [], is_optional: true });
+    if (cmd === "discover_acp_commands") return Promise.resolve([]);
     if (cmd === "get_runtime_file_config") return Promise.resolve(null);
     return Promise.reject(new Error(`unmocked: ${cmd}`));
   };
@@ -702,4 +703,64 @@ test("DefaultConfigStep: effort write→save→reread contract through the real 
     triggerRemount.textContent?.includes("Off"),
     `DefaultConfigStep trigger must show "Off" after fresh remount; got: "${triggerRemount.textContent}"`,
   );
+});
+
+test("ACP default saves only on Save and survives reload and failed discovery", async () => {
+  const command = "buzz-repair33fb8fe-acp";
+  const initial = {
+    ...DEFAULT_CONFIG,
+    env_vars: { ANTHROPIC_API_KEY: "sk-test" },
+    provider: "anthropic",
+    model: "claude-3-5-sonnet",
+    default_acp_command: command,
+  };
+  globalThis.__TAURI_INTERNALS__.invoke = makeIpcHandler({
+    get_global_agent_config: () => Promise.resolve(initial),
+    discover_acp_commands: () =>
+      Promise.reject(new Error("discovery unavailable")),
+  });
+  const client = makeQueryClient();
+  seedGooseRuntime(client);
+  const mounted = render(
+    withQueryClient(client, createElement(AgentDefaultsEditor)),
+  );
+  await settle();
+  const picker = screen.getByLabelText("Default ACP command");
+  assert.ok(picker.textContent.includes(command));
+  assert.equal(saveCallCount, 0);
+
+  // A catalog failure must preserve the saved command, not silently reset it.
+  // Select stock explicitly, then save through the real parent component.
+  await act(async () => {
+    fireEvent.keyDown(picker, { key: "Enter" });
+  });
+  await settle();
+  await act(async () => {
+    fireEvent.click(
+      screen.getByRole("menuitemradio", { name: "Buzz ACP (default)" }),
+    );
+  });
+  await settle();
+  assert.equal(saveCallCount, 0);
+  await act(async () => {
+    fireEvent.click(screen.getByRole("button", { name: "Save defaults" }));
+  });
+  await settle();
+  assert.equal(saveCallCount, 1);
+  assert.equal(capturedSavePayload.default_acp_command, null);
+  mounted.unmount();
+
+  globalThis.__TAURI_INTERNALS__.invoke = makeIpcHandler({
+    get_global_agent_config: () => Promise.resolve(storedCanonicalResponse),
+  });
+  const remountClient = makeQueryClient();
+  seedGooseRuntime(remountClient);
+  render(withQueryClient(remountClient, createElement(AgentDefaultsEditor)));
+  await settle();
+  assert.ok(
+    screen
+      .getByLabelText("Default ACP command")
+      .textContent.includes("Buzz ACP"),
+  );
+  assert.equal(saveCallCount, 1);
 });

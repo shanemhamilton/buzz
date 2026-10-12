@@ -70,6 +70,10 @@ pub struct GlobalAgentConfig {
     /// Preferred ACP runtime for definitions without an explicit runtime.
     #[serde(default)]
     pub preferred_runtime: Option<String>,
+
+    /// ACP command persisted on newly created agents/personas that omit one.
+    #[serde(default)]
+    pub default_acp_command: Option<String>,
 }
 
 /// Validate a `GlobalAgentConfig` before persisting it.
@@ -140,6 +144,14 @@ pub fn validate_global_config(config: &GlobalAgentConfig) -> Result<(), String> 
         }
     }
 
+    super::validate_portable_acp_command(
+        config
+            .default_acp_command
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty()),
+    )?;
+
     Ok(())
 }
 
@@ -172,6 +184,43 @@ pub fn normalize_global_config_fields(config: &mut GlobalAgentConfig) {
             config.model = None;
         }
     }
+    if let Some(v) = &config.default_acp_command {
+        let trimmed = v.trim();
+        config.default_acp_command = (!trimmed.is_empty()).then(|| trimmed.to_string());
+    }
+}
+
+/// Resolve the command stored on a newly-created definition or agent.
+/// Explicit values win, then the configured global default, then stock ACP.
+pub(crate) fn resolve_created_acp_command(
+    explicit: Option<&str>,
+    global: &GlobalAgentConfig,
+) -> String {
+    explicit
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| global.default_acp_command.as_deref())
+        .unwrap_or(super::DEFAULT_ACP_COMMAND)
+        .to_string()
+}
+
+/// Resolve the command for a new managed agent. An existing linked persona
+/// owns its command; an absent persona command means stock ACP for legacy
+/// definitions and must not inherit a newly configured global default.
+pub(crate) fn resolve_created_agent_acp_command(
+    persona_command: Option<Option<&str>>,
+    explicit: Option<&str>,
+    global: &GlobalAgentConfig,
+) -> String {
+    if let Some(persona_command) = persona_command {
+        return persona_command
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| explicit.map(str::trim).filter(|value| !value.is_empty()))
+            .unwrap_or(super::DEFAULT_ACP_COMMAND)
+            .to_string();
+    }
+    resolve_created_acp_command(explicit, global)
 }
 
 fn global_config_path<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<std::path::PathBuf, String> {
